@@ -305,16 +305,23 @@ pub(crate) fn collect_all(
     entries
 }
 
+/// パスを大小文字を無視して比較する (通常はアロケートしない)。
+/// 語末 Σ → ς の文脈依存変換があるため、Σ を含む場合は文字列化して比較する。
+fn path_case_cmp(a: &str, b: &str) -> Ordering {
+    if a.contains('Σ') || b.contains('Σ') {
+        return a.to_lowercase().cmp(&b.to_lowercase());
+    }
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 /// フラット一覧の並び替え。top は切り詰め件数 (0 = 無制限)。
 pub(crate) fn sort_entries(entries: &mut Vec<Entry>, field: SortField, dir: SortDir, top: usize) {
     entries.sort_by(|a, b| {
         let primary = match field {
             SortField::Size => a.size.cmp(&b.size),
-            SortField::Name => a
-                .path
-                .to_lowercase()
-                .cmp(&b.path.to_lowercase())
-                .then_with(|| a.path.cmp(&b.path)),
+            SortField::Name => path_case_cmp(&a.path, &b.path).then_with(|| a.path.cmp(&b.path)),
             SortField::Count => a.files.cmp(&b.files),
             SortField::Mtime => a.mtime.cmp(&b.mtime),
         };
@@ -633,8 +640,10 @@ mod tests {
         let mut buf = Vec::new();
         write_flat(&mut buf, &outcome, &meta, &opts(OutputFormat::Flat)).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("/root/large/a.bin"));
-        assert!(s.contains("/root/top.bin"));
+        // 区切り文字は OS に従う (Windows は \)
+        let sep = MAIN_SEPARATOR;
+        assert!(s.contains(&format!("/root{sep}large{sep}a.bin")), "{s}");
+        assert!(s.contains(&format!("/root{sep}top.bin")), "{s}");
     }
 
     #[test]
@@ -701,6 +710,43 @@ mod tests {
             assert!(!s.contains("http://"));
             assert!(!s.contains("https://"));
         }
+    }
+
+    #[test]
+    fn blocked_dirs_are_labeled_not_links() {
+        // -x 境界などで走査しない実ディレクトリは "(link)" ではなく
+        // "(対象外)" と表示される。
+        let mut tree = Tree::with_root("/root".into(), 0);
+        tree.push_child_capped(0, Node::blocked("other-fs".into(), 0, 1, 0), 100)
+            .unwrap();
+        tree.push_child_capped(0, Node::other("l".into(), 0, 1, 0, 0, 0), 100)
+            .unwrap();
+        tree.aggregate();
+        let outcome = ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            truncated: false,
+            cancelled: false,
+            entries: 2,
+            dirs: 0,
+            error_count: 0,
+            bytes_alloc: 0,
+            bytes_logical: 0,
+            elapsed: Duration::from_millis(1),
+            root: PathBuf::from("/root"),
+        };
+        let (_, meta) = fixture();
+        for format in [OutputFormat::Tree, OutputFormat::Flat] {
+            let mut buf = Vec::new();
+            output_for_test(&mut buf, &outcome, &meta, &opts(format)).unwrap();
+            let s = String::from_utf8(buf).unwrap();
+            assert!(s.contains("other-fs (対象外)"), "{format:?}: {s}");
+        }
+        // リンクは従来どおり "(link)"。
+        let mut buf = Vec::new();
+        output_for_test(&mut buf, &outcome, &meta, &opts(OutputFormat::Tree)).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("l (link)"), "{s}");
     }
 
     fn output_for_test(

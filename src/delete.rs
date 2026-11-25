@@ -39,7 +39,9 @@ pub fn remove_target(path: &Path, kind: NodeKind) -> Result<(), String> {
     let ft = md.file_type();
     let link_like = ft.is_symlink() || platform::is_reparse_point(&md);
 
-    if link_like || kind == NodeKind::Other {
+    // Blocked (-x 境界などで走査しなかった実ディレクトリ) も再帰削除はしない。
+    // 実ディレクトリなら空のときだけ削除できる。
+    if link_like || matches!(kind, NodeKind::Other | NodeKind::Blocked) {
         remove_link_or_leaf(&fs_path, &md)?;
         return Ok(());
     }
@@ -57,7 +59,7 @@ pub fn remove_target(path: &Path, kind: NodeKind) -> Result<(), String> {
             }
             fs::remove_file(&fs_path).map_err(|e| format!("削除に失敗: {e}"))
         }
-        NodeKind::Other => unreachable!("Other は上で処理済み"),
+        NodeKind::Other | NodeKind::Blocked => unreachable!("Other / Blocked は上で処理済み"),
     }
 }
 
@@ -147,5 +149,20 @@ mod tests {
         assert!(!link.exists());
         assert!(target.exists());
         assert!(target.join("keep.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_kind_refuses_recursive_delete() {
+        // Blocked (走査対象外の実ディレクトリ) は中身ごと削除しない。
+        // 空でないフォルダは削除に失敗する。
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("a.bin"), b"x").unwrap();
+
+        let err = remove_target(&victim, NodeKind::Blocked).unwrap_err();
+        assert!(!err.is_empty(), "{err}");
+        assert!(victim.exists());
     }
 }

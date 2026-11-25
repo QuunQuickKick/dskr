@@ -120,12 +120,25 @@ impl FromStr for SortSpec {
     }
 }
 
-fn name_lower(tree: &Tree, i: u32) -> String {
-    tree.node(i).name.to_string_lossy().to_lowercase()
+/// 名前を大小文字を無視して比較する (通常はアロケートしない)。
+/// Unicode の大文字小文字は 1 文字が複数文字へ展開され得るため、
+/// `char::to_lowercase` を遅延評価で比較する。
+/// `str::to_lowercase` だけが持つ文脈依存の語末 Σ → ς の変換に対応するため、
+/// Σ を含む名前では従来どおり文字列化して比較する。
+fn name_case_cmp(tree: &Tree, a: u32, b: u32) -> Ordering {
+    let al = tree.node(a).name.to_string_lossy();
+    let bl = tree.node(b).name.to_string_lossy();
+    if al.contains('Σ') || bl.contains('Σ') {
+        return al.to_lowercase().cmp(&bl.to_lowercase());
+    }
+    al.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(bl.chars().flat_map(char::to_lowercase))
 }
 
-fn name_raw(tree: &Tree, i: u32) -> String {
-    tree.node(i).name.to_string_lossy().into_owned()
+/// 名前をバイト列で比較する (タイブレーク用)。
+fn name_raw_cmp(tree: &Tree, a: u32, b: u32) -> Ordering {
+    tree.node(a).name.as_ref().cmp(tree.node(b).name.as_ref())
 }
 
 /// ノード a と b を指定条件で比較する。
@@ -149,9 +162,7 @@ pub fn compare_nodes(
                 na.total_logical.cmp(&nb.total_logical)
             }
         }
-        SortField::Name => name_lower(tree, a)
-            .cmp(&name_lower(tree, b))
-            .then_with(|| name_raw(tree, a).cmp(&name_raw(tree, b))),
+        SortField::Name => name_case_cmp(tree, a, b).then_with(|| name_raw_cmp(tree, a, b)),
         SortField::Count => tree.node(a).file_count.cmp(&tree.node(b).file_count),
         SortField::Mtime => tree.node(a).mtime.cmp(&tree.node(b).mtime),
     };
@@ -165,7 +176,7 @@ pub fn compare_nodes(
     if field == SortField::Name {
         primary
     } else {
-        primary.then_with(|| name_raw(tree, a).cmp(&name_raw(tree, b)))
+        primary.then_with(|| name_raw_cmp(tree, a, b))
     }
 }
 
@@ -274,5 +285,72 @@ mod tests {
             field = field.next();
         }
         assert_eq!(field, SortField::Size);
+    }
+
+    /// 旧実装 (to_lowercase で文字列化して比較) と同じ順序になることを
+    /// 多様な名前で検証する (アロケート除去のリグレッション防止)。
+    #[test]
+    fn name_order_matches_legacy_lowercase_semantics() {
+        let names = [
+            "A.txt",
+            "a.txt",
+            "B.txt",
+            "b.txt",
+            "Z",
+            "z",
+            "ÁBC",
+            "ábc",
+            "İx",
+            "i̇x",
+            "ファイル",
+            "ﾌｧｲﾙ",
+            "ΣΟΦΟΣ",
+            "σοφος",
+            "img (1).png",
+            "img(1).png",
+            "10",
+            "2",
+        ];
+        let mut t = Tree::with_root("root".into(), 0);
+        for (i, name) in names.iter().enumerate() {
+            t.push_child_capped(
+                0,
+                Node::file((*name).into(), 0, 1, (i as u64) + 1, (i as u64) + 1, 0),
+                100,
+            )
+            .unwrap();
+        }
+        t.aggregate();
+        let ids: Vec<u32> = t.node(0).children.clone();
+
+        let legacy = |dir: SortDir| -> Vec<String> {
+            let mut ids = ids.clone();
+            ids.sort_by(|&a, &b| {
+                let la = t.node(a).name.to_string_lossy().to_lowercase();
+                let lb = t.node(b).name.to_string_lossy().to_lowercase();
+                let ord = la.cmp(&lb).then_with(|| {
+                    t.node(a)
+                        .name
+                        .to_string_lossy()
+                        .cmp(&t.node(b).name.to_string_lossy())
+                });
+                if dir == SortDir::Desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+            ids.iter()
+                .map(|&i| t.node(i).name.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let got: Vec<String> = sorted_children(&t, 0, SortField::Name, dir, true)
+                .iter()
+                .map(|&i| t.node(i).name.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, legacy(dir), "dir={dir:?}");
+        }
     }
 }

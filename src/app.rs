@@ -7,7 +7,7 @@ use crate::delete;
 use crate::format::SizeFormat;
 use crate::output::{self, OutputFormat, OutputOptions};
 use crate::path::RootKind;
-use crate::report::{self, ReportMeta};
+use crate::report;
 use crate::scan::engine::{Control, ControlState, Progress, ScanOutcome};
 use crate::scan::node::{NodeKind, Tree};
 use crate::scan::platform;
@@ -187,19 +187,6 @@ impl App {
 
     pub fn cur(&self) -> u32 {
         *self.stack.last().unwrap_or(&0)
-    }
-
-    pub fn metric_of(&self, i: u32) -> u64 {
-        match self.tree().map(|t| t.node(i)) {
-            Some(n) => {
-                if self.show_allocated {
-                    n.total_alloc
-                } else {
-                    n.total_logical
-                }
-            }
-            None => 0,
-        }
     }
 
     pub fn metric_label(&self) -> &'static str {
@@ -644,22 +631,15 @@ impl App {
                 e.to_string()
             }
         })?;
-        let meta = ReportMeta {
-            version: env!("CARGO_PKG_VERSION"),
-            generated_at: report::iso_now(),
-            root: self.root_display.clone(),
-            root_kind: self.root_kind.label(),
-            profile: self.profile_label.clone(),
-            metric: self.metric_label(),
-            options: self.engine_options.clone(),
-            cancelled: out.cancelled,
-            truncated: out.truncated,
-            threads: self.threads,
-            entries: out.entries,
-            dirs: out.dirs,
-            errors: out.error_count,
-            elapsed_ms: out.elapsed.as_millis(),
-        };
+        let meta = report::build_meta(
+            out,
+            &self.root_display,
+            self.root_kind.label(),
+            &self.profile_label,
+            self.threads,
+            &self.engine_options,
+            self.metric_label(),
+        );
         let opts = OutputOptions {
             format: req.format,
             depth: req.depth,

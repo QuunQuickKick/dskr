@@ -393,6 +393,7 @@ fn row(
     match n.kind {
         NodeKind::Dir => name.push('/'),
         NodeKind::Other => name.push_str(" (link)"),
+        NodeKind::Blocked => name.push_str(" (対象外)"),
         NodeKind::File => {}
     }
 
@@ -401,15 +402,15 @@ fn row(
     } else {
         String::new()
     };
-    let marker = truncate_width(&marker_raw, cols.name);
+    let marker = fit_width(&marker_raw, cols.name);
     let marker_w = marker.width();
     let name_avail = cols.name.saturating_sub(marker_w);
-    let name = truncate_width(&name, name_avail);
+    let name = fit_width(&name, name_avail);
     let name_pad = cols.name.saturating_sub(name.width() + marker_w);
 
     let name_style = match n.kind {
         NodeKind::Dir => base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        NodeKind::Other => dim,
+        NodeKind::Other | NodeKind::Blocked => dim,
         NodeKind::File => base,
     };
     spans.push(Span::styled(name, name_style));
@@ -646,6 +647,7 @@ fn draw_confirm_delete(f: &mut Frame, app: &App, area: Rect) {
         NodeKind::Dir => "フォルダ (中身ごと)",
         NodeKind::File => "ファイル",
         NodeKind::Other => "リンク / 特殊 (中身は削除しません)",
+        NodeKind::Blocked => "走査対象外 (中身は削除しません)",
     };
     let path = target.path.display().to_string();
     let path = short_path_display(
@@ -709,6 +711,14 @@ fn draw_confirm_delete(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(
             fit_width(" リンク先は削除せず、リンク自体だけを削除します。", inner_w),
             Style::new(),
+        )));
+    } else if target.kind == NodeKind::Blocked {
+        lines.push(Line::from(Span::styled(
+            fit_width(
+                " 走査していない項目です。空のフォルダしか削除できません。",
+                inner_w,
+            ),
+            Style::new().fg(Color::Yellow),
         )));
     }
     if app.profile_label == "network" {
@@ -865,7 +875,7 @@ fn draw_export_form(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// 表示幅で末尾を省略する (先頭を残す)。
+/// 表示幅 (日本語は2桁) で末尾を省略する (先頭を残す)。
 fn fit_width(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -887,36 +897,14 @@ fn fit_width(s: &str, max: usize) -> String {
     out
 }
 
-/// 表示幅 (日本語は2桁) で切り詰める。
-fn truncate_width(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut w = 0usize;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        if w + cw > max.saturating_sub(1) {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out.push('…');
-    out
-}
-
 fn pad_left(s: &str, width: usize) -> String {
-    let t = truncate_width(s, width);
+    let t = fit_width(s, width);
     let pad = width.saturating_sub(t.width());
     format!("{}{}", " ".repeat(pad), t)
 }
 
 fn pad_right(s: &str, width: usize) -> String {
-    let t = truncate_width(s, width);
+    let t = fit_width(s, width);
     let pad = width.saturating_sub(t.width());
     format!("{}{}", t, " ".repeat(pad))
 }

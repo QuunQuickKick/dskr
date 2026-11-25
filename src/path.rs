@@ -197,6 +197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn classify_unix_rejects_unc() {
         let r = classify_root(Path::new("\\\\server\\share"));
         assert!(r.is_err());

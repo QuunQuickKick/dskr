@@ -316,6 +316,8 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 }
 ```
 
+`tree` の `type` は `dir` / `file` / `other` (リンク・特殊ファイル) / `blocked` (`-x` や `--local-only` で走査しないフォルダ。中身は集計されない) のいずれかです。
+
 CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated`
 
 ## パフォーマンス

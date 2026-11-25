@@ -204,7 +204,7 @@ fn try_main(cli: Cli) -> Result<u32, String> {
             size_format,
         )
     } else {
-        tui(
+        tui(TuiParams {
             cfg,
             progress,
             control,
@@ -212,12 +212,12 @@ fn try_main(cli: Cli) -> Result<u32, String> {
             kind,
             profile_label,
             threads,
-            want_allocated,
-            cli.allow_delete,
+            show_allocated: want_allocated,
+            allow_delete: cli.allow_delete,
             options_json,
             sort_spec,
             size_format,
-        )
+        })
     }
 }
 
@@ -299,34 +299,6 @@ fn options_json(cli: &Cli, threads: usize, rate: u64, profile: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_meta(
-    outcome: &dskr::scan::ScanOutcome,
-    root: &Path,
-    kind: RootKind,
-    profile: &str,
-    threads: usize,
-    options_json: &str,
-    metric: &'static str,
-) -> ReportMeta {
-    ReportMeta {
-        version: env!("CARGO_PKG_VERSION"),
-        generated_at: report::iso_now(),
-        root: root.to_string_lossy().into_owned(),
-        root_kind: kind.label(),
-        profile: profile.to_string(),
-        metric,
-        options: options_json.to_string(),
-        cancelled: outcome.cancelled,
-        truncated: outcome.truncated,
-        threads,
-        entries: outcome.entries,
-        dirs: outcome.dirs,
-        errors: outcome.error_count,
-        elapsed_ms: outcome.elapsed.as_millis(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn write_output_target(
     path: Option<&Path>,
     outcome: &dskr::scan::ScanOutcome,
@@ -382,10 +354,10 @@ fn headless(
     } else {
         "logical"
     };
-    let meta = build_meta(
+    let meta = report::build_meta(
         &outcome,
-        &cfg_root,
-        kind,
+        &cfg_root.to_string_lossy(),
+        kind.label(),
         profile_label,
         threads,
         options_json,
@@ -456,8 +428,8 @@ fn headless(
     Ok(if outcome.cancelled { 130 } else { 0 })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn tui(
+/// TUI 起動に必要な一式。try_main で組み立てて tui() へ渡す。
+struct TuiParams {
     cfg: EngineConfig,
     progress: Arc<Progress>,
     control: Arc<Control>,
@@ -470,7 +442,9 @@ fn tui(
     options_json: String,
     sort_spec: SortSpec,
     size_format: SizeFormat,
-) -> Result<u32, String> {
+}
+
+fn tui(p: TuiParams) -> Result<u32, String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
         let _ = disable_raw_mode();
@@ -485,20 +459,7 @@ fn tui(
         default_hook(info);
     }));
 
-    let res = run_tui(
-        cfg,
-        progress,
-        control,
-        root,
-        kind,
-        profile_label,
-        threads,
-        show_allocated,
-        allow_delete,
-        options_json,
-        sort_spec,
-        size_format,
-    );
+    let res = run_tui(p);
 
     let _ = disable_raw_mode();
     let _ = execute!(stdout(), LeaveAlternateScreen);
@@ -516,21 +477,22 @@ fn tui(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_tui(
-    cfg: EngineConfig,
-    progress: Arc<Progress>,
-    control: Arc<Control>,
-    root: PathBuf,
-    kind: RootKind,
-    profile_label: String,
-    threads: usize,
-    show_allocated: bool,
-    allow_delete: bool,
-    options_json: String,
-    sort_spec: SortSpec,
-    size_format: SizeFormat,
-) -> Result<(u32, bool), String> {
+fn run_tui(p: TuiParams) -> Result<(u32, bool), String> {
+    let TuiParams {
+        cfg,
+        progress,
+        control,
+        root,
+        kind,
+        profile_label,
+        threads,
+        show_allocated,
+        allow_delete,
+        options_json,
+        sort_spec,
+        size_format,
+    } = p;
+
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).map_err(|e| e.to_string())?;
     let _ = terminal.clear();
 

@@ -1,11 +1,14 @@
 use std::ffi::{OsStr, OsString};
 
 /// ノード種別。Other はシンボリックリンク・ジャンクション・特殊ファイルなど。
+/// Blocked は -x / --local-only などにより走査しないと決めた実ディレクトリ
+/// (中身は集計されない)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
     Dir,
     File,
     Other,
+    Blocked,
 }
 
 /// アリーナ方式のツリーノード。インデックス (u32) で参照する。
@@ -92,6 +95,27 @@ impl Node {
             own_logical: logical,
             total_alloc: alloc,
             total_logical: logical,
+            file_count: 0,
+            dir_count: 0,
+            err_count: 0,
+            mtime,
+            depth,
+            truncated: false,
+        }
+    }
+
+    /// 走査しない実ディレクトリ (-x 境界・ネットワークFSなど)。
+    /// 中身を調べていないためサイズは 0。
+    pub fn blocked(name: OsString, parent: u32, depth: u16, mtime: i64) -> Node {
+        Node {
+            name: name.into_boxed_os_str(),
+            parent,
+            children: Vec::new(),
+            kind: NodeKind::Blocked,
+            own_alloc: 0,
+            own_logical: 0,
+            total_alloc: 0,
+            total_logical: 0,
             file_count: 0,
             dir_count: 0,
             err_count: 0,
@@ -282,5 +306,26 @@ mod tests {
         let n2 = t.push_child_capped(0, Node::file("b".into(), 0, 1, 1, 1, 0), 2);
         assert!(n2.is_none());
         assert!(t.node(0).truncated);
+    }
+
+    #[test]
+    fn blocked_is_not_counted_as_dir() {
+        // 走査していないディレクトリなので、集計にはディレクトリ数・サイズと
+        // して現れない。
+        let mut t = Tree::with_root("root".into(), 0);
+        let b = t
+            .push_child_capped(0, Node::blocked("other-fs".into(), 0, 1, 0), 100)
+            .unwrap();
+        t.push_child_capped(0, Node::file("a".into(), 0, 1, 10, 10, 0), 100)
+            .unwrap();
+        t.aggregate();
+        assert_eq!(t.node(b).kind, NodeKind::Blocked);
+        assert_eq!(t.node(b).total_alloc, 0);
+        assert_eq!(t.node(b).file_count, 0);
+        assert_eq!(t.node(0).dir_count, 0);
+        assert_eq!(t.node(0).file_count, 1);
+        // detach しても祖先の集計は変化しない (中身を持たないため)。
+        assert!(t.detach(b));
+        assert_eq!(t.node(0).total_alloc, 10);
     }
 }

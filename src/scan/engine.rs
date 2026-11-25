@@ -195,9 +195,11 @@ struct Shared {
 
 /// 200ms 窓のトークンバケット。rate=0 は無制限。
 /// 低レート指定 (50/s等) でも窓あたり最低1トークンを保証する。
+/// 窓の計算には単調時計を使う (壁時計の NTP 調整に影響されない)。
 struct Pacer {
     tokens_per_window: u64,
     window_ms: u64,
+    start: Instant,
     inner: Mutex<(u64, u64)>, // (window, tokens)
 }
 
@@ -211,6 +213,7 @@ impl Pacer {
         Pacer {
             tokens_per_window,
             window_ms,
+            start: Instant::now(),
             inner: Mutex::new((0, 0)),
         }
     }
@@ -220,10 +223,7 @@ impl Pacer {
             return;
         }
         loop {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            let now = self.start.elapsed().as_millis() as u64;
             let w = now / self.window_ms;
             {
                 let mut g = lock(&self.inner);
@@ -521,12 +521,10 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 None
             };
             if !sh.dir_allowed(&child_path, volume, false) {
-                batch.push(Node::other(
+                batch.push(Node::blocked(
                     name,
                     node,
                     depth + 1,
-                    0,
-                    md.len(),
                     platform::mtime_secs(&md),
                 ));
                 continue;
@@ -549,40 +547,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
         }
 
         if ft.is_file() {
-            let logical = md.len();
-            if logical < sh.cfg.min_size {
-                continue;
-            }
-            if sh.cfg.skip_cloud_placeholders && platform::is_cloud_placeholder(&md) {
-                continue;
-            }
-            let alloc = platform::file_allocated(&md, &child_path, sh.cfg.want_allocated);
-            let own_alloc = match sh.hardlink_key(&md, &child_path) {
-                Some(key) => {
-                    let mut m = lock(&sh.hardlinks);
-                    if let std::collections::hash_map::Entry::Vacant(e) = m.entry(key) {
-                        e.insert(());
-                        alloc
-                    } else {
-                        0 // 既に計上済みの実体
-                    }
-                }
-                None => alloc,
-            };
-            batch.push(Node::file(
-                name,
-                node,
-                depth + 1,
-                own_alloc,
-                logical,
-                platform::mtime_secs(&md),
-            ));
-            sh.progress
-                .bytes_alloc
-                .fetch_add(own_alloc, Ordering::Relaxed);
-            sh.progress
-                .bytes_logical
-                .fetch_add(logical, Ordering::Relaxed);
+            sh.add_file(&mut batch, name, node, depth + 1, &md, &child_path);
             continue;
         }
 
@@ -642,37 +607,9 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                     }
                 }
                 Ok(tmd) => {
-                    let logical = tmd.len();
-                    if logical >= sh.cfg.min_size {
-                        let alloc =
-                            platform::file_allocated(&tmd, &child_path, sh.cfg.want_allocated);
-                        let own_alloc = match sh.hardlink_key(&tmd, &child_path) {
-                            Some(key) => {
-                                let mut m = lock(&sh.hardlinks);
-                                if let std::collections::hash_map::Entry::Vacant(e) = m.entry(key) {
-                                    e.insert(());
-                                    alloc
-                                } else {
-                                    0
-                                }
-                            }
-                            None => alloc,
-                        };
-                        batch.push(Node::file(
-                            name,
-                            node,
-                            depth + 1,
-                            own_alloc,
-                            logical,
-                            platform::mtime_secs(&tmd),
-                        ));
-                        sh.progress
-                            .bytes_alloc
-                            .fetch_add(own_alloc, Ordering::Relaxed);
-                        sh.progress
-                            .bytes_logical
-                            .fetch_add(logical, Ordering::Relaxed);
-                    }
+                    // リンク先がファイルの場合も直接走査と同じフィルタ
+                    // (min_size / クラウドプレースホルダ) を適用する。
+                    sh.add_file(&mut batch, name, node, depth + 1, &tmd, &child_path);
                 }
                 Err(e) => {
                     sh.record_error(&child_path, e.to_string(), Some(node));
@@ -761,14 +698,61 @@ impl Shared {
         }
     }
 
-    /// ハードリンク判定。Windows のネットワークプロファイルでは
+    /// ハードリンク判定が必要か。Windows のネットワークプロファイルでは
     /// 追加のネットワーク往復 (ハンドルオープン) を避けるため省略する。
-    fn hardlink_key(&self, md: &Metadata, path: &Path) -> Option<(u64, u64)> {
-        if self.cfg.network && cfg!(windows) {
-            None
-        } else {
-            platform::hardlink_key(md, path)
+    fn want_hardlink(&self) -> bool {
+        !(self.cfg.network && cfg!(windows))
+    }
+
+    /// ファイルノードをバッチへ追加する。min_size とクラウドプレースホルダ
+    /// 除外を適用し、ハードリンクの重複計上もここで処理する。
+    /// 追加した場合は true を返す。
+    fn add_file(
+        &self,
+        batch: &mut Vec<Node>,
+        name: OsString,
+        parent: u32,
+        depth: u16,
+        md: &Metadata,
+        path: &Path,
+    ) -> bool {
+        let logical = md.len();
+        if logical < self.cfg.min_size {
+            return false;
         }
+        if self.cfg.skip_cloud_placeholders && platform::is_cloud_placeholder(md) {
+            return false;
+        }
+        // 割当サイズとハードリンクキー (Windows では 1 回のハンドルオープンで両方)。
+        let info =
+            platform::file_size_info(md, path, self.cfg.want_allocated, self.want_hardlink());
+        let own_alloc = match info.hardlink {
+            Some(key) => {
+                let mut m = lock(&self.hardlinks);
+                if let std::collections::hash_map::Entry::Vacant(e) = m.entry(key) {
+                    e.insert(());
+                    info.alloc
+                } else {
+                    0 // 既に計上済みの実体
+                }
+            }
+            None => info.alloc,
+        };
+        batch.push(Node::file(
+            name,
+            parent,
+            depth,
+            own_alloc,
+            logical,
+            platform::mtime_secs(md),
+        ));
+        self.progress
+            .bytes_alloc
+            .fetch_add(own_alloc, Ordering::Relaxed);
+        self.progress
+            .bytes_logical
+            .fetch_add(logical, Ordering::Relaxed);
+        true
     }
 
     /// ディレクトリノードを登録して走査タスクを投入する。

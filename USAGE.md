@@ -238,6 +238,7 @@ dskr /var --no-tui --json out.json --csv out.csv
 ```
 
 - `--output -` または省略時は標準出力です
+- `--output` でファイルを指定した場合、既存ファイルは上書きされます。上書きしたくない場合は TUI の保存 (`e`) を使用してください
 - `--format` / `--json` / `--csv` を指定すると、画面なしで出力します
 - `--json` / `--csv` はファイル出力で、`--format json` / `--format csv` の別名です
 - `--top 0` は無制限です。巨大な出力になる点に注意してください
@@ -247,8 +248,11 @@ dskr /var --no-tui --json out.json --csv out.csv
 - `--sort` は `tree` / `flat` の並びに適用されます
 - `--ascii` でツリーの罫線を ASCII にできます
 - `--color auto|always|never` で色付けを制御します
+- 「走査: N 項目」の項目数は、隠しファイルの除外・`--min-size` / `--exclude` / `--max-depth` で集計から外した項目も含む「調べた項目数」です
 
 JSON はツリー全体を、CSV はフラットな行を出力します。JSON / CSV は制御文字や表計算の数式を無害化します。
+
+`-x` や `--local-only` で走査しないと決めたフォルダは、一覧では `(対象外)` と表示され、JSON の `"type"` は `"blocked"` になります (中身は集計されません)。
 
 ## 6. ネットワーク共有
 

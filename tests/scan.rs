@@ -88,7 +88,21 @@ fn symlink_not_followed_by_default() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&sub, dir.path().join("link")).unwrap();
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&sub, dir.path().join("link")).unwrap();
+    {
+        // Windows ではシンボリックリンクの作成に特権が必要
+        // (管理者実行または開発者モード)。権限がなければ検証をスキップする。
+        use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
+        match std::os::windows::fs::symlink_dir(&sub, dir.path().join("link")) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD as i32) => {
+                println!(
+                    "(スキップ: シンボリックリンク作成の特権がありません。管理者実行または開発者モードで検証できます)"
+                );
+                return;
+            }
+            Err(e) => panic!("symlink_dir 失敗: {e}"),
+        }
+    }
 
     let out = scan(dir.path(), cfg(dir.path()));
     let root = out.tree.node(out.tree.root);

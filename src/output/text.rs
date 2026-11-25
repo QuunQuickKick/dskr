@@ -185,6 +185,7 @@ pub(crate) fn write_flat(
                 }
             }
             NodeKind::Other => path.push_str(" (link)"),
+            NodeKind::Blocked => path.push_str(" (対象外)"),
             NodeKind::File => {}
         }
         let path = if opts.color && e.kind == NodeKind::Dir {
@@ -266,7 +267,7 @@ fn render_children(
         let pct = percent(size, total);
         let kind_color = match node.kind {
             NodeKind::Dir => "36",
-            NodeKind::Other => "2",
+            NodeKind::Other | NodeKind::Blocked => "2",
             NodeKind::File => "0",
         };
         let label = if color {
@@ -305,6 +306,7 @@ fn display_name(node: &crate::scan::node::Node) -> String {
     match node.kind {
         NodeKind::Dir => name.push('/'),
         NodeKind::Other => name.push_str(" (link)"),
+        NodeKind::Blocked => name.push_str(" (対象外)"),
         NodeKind::File => {}
     }
     name
