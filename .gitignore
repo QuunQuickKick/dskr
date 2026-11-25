@@ -1,0 +1,22 @@
+# ビルド成果物
+/target
+/dist
+
+# オフラインビルド用の生成物 (README の cargo vendor 手順)
+/vendor
+/.cargo/config.toml
+
+# TUI の e キーでカレントディレクトリに保存されるレポート
+/dskr-*.txt
+/dskr-*.md
+/dskr-*.html
+/dskr-*.json
+/dskr-*.csv
+
+# OS / エディタの一時ファイル
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~

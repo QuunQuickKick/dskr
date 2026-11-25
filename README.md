@@ -1,0 +1,380 @@
+# dskr — a fast file-size & disk-usage finder
+
+高速なファイルサイズ・ディスク使用量ファインダー。指定ディレクトリ配下の
+ファイル・フォルダがどれだけディスクを使っているかを高速に調べ、
+ターミナルで確認できるツールです。Windows / macOS / Linux で動作する
+単一バイナリとして配布できます。
+
+> 詳細な使い方、OS ごとの対応表、トラブルシューティングは [USAGE.md](USAGE.md) を参照してください。`dskr --help` は実行する OS に合わせた内容を表示します。
+
+```text
+dskr レポート
+対象       : /usr
+種類       : ローカル
+走査       : 30,538 項目 / 3,478 フォルダ / 1.60 秒 / 12 スレッド
+合計       : 7.3 GiB (ディスク使用量) / 7.3 GiB (見かけのサイズ)
+ファイル   : 30,538   フォルダ: 3,478   エラー: 0
+
+容量の大きいフォルダ (10):
+       6.8 GiB   93.6%       8134  /usr/lib
+     230.2 MiB    3.1%       2210  /usr/share
+     101.6 MiB    1.4%        412  /usr/bin
+     ...
+```
+
+## 特徴
+
+- **高速**: 複数のスレッドで並列に調べます。ファイルの中身は読みません (Windows のみ、ローカルのハードリンク判定に属性を 1 回読みます。ネットワークでは省略)
+- **正確**: ディスク上の使用量と見かけのサイズの両方を集計
+  - Unix: `st_blocks × 512` (スパースファイル対応)
+  - Windows: `GetCompressedFileSizeW` (NTFS 圧縮対応)
+- **安全**: 既定は読み取り専用。`--allow-delete` を指定したときだけ、TUI で確認付きの削除ができます
+- **隠し項目は既定で非表示**: ドットファイル (`.git`、`.env` など) や Windows のシステムファイルは、`--hidden` を指定したときだけ表示・集計します
+- **外部送信なし**: ネットワーク通信コードを持たず、テレメトリも送信しません (UNC/ネットワークドライブを指定した場合のみ、OS の SMB アクセスが発生します)
+- **負荷を抑えられる**: スレッド数・nice・I/O 優先度・1秒あたりの処理数上限を指定できます
+- **単一バイナリ**: ランタイム不要。SSH 先でも動作
+- **見やすい出力**: ターミナル用レポート / フォルダ構成 / `du` 風一覧 / Markdown / 単一 HTML
+
+## ビルド
+
+```sh
+cargo build --release
+# ./target/release/dskr
+```
+
+配布用のバイナリを作るときは、ビルド環境のローカルパスが混入しないよう
+`--remap-path-prefix` を付けます。Windows のビルドスクリプトは自動で設定します。
+
+```sh
+RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$PWD=/src" cargo build --release
+```
+
+### Windows 実機でのビルド
+
+Windows 10/11 (64bit) にプロジェクトフォルダをコピーし、次を用意します。
+
+1. **Rust (MSVC ツールチェーン)** — <https://rustup.rs> または `winget install Rustlang.Rustup`
+2. **Visual Studio Build Tools 2022** の「C++ によるデスクトップ開発」
+
+そのうえで、フォルダ直下の `build-windows.cmd` をダブルクリックするか、PowerShell から実行します。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Test -Zip
+```
+
+| オプション | 意味 |
+|---|---|
+| `-Test` | ビルド前に `cargo test --release` を実行 |
+| `-Zip` | `dskr.exe` + README + USAGE + LICENSE + ハッシュを同梱した zip を `dist\` に作成 |
+| `-Clean` | 事前に `cargo clean` |
+| `-NoSmoke` | 生成した exe の起動確認を省略 |
+| `-Offline` | `vendor/` を使ったオフラインビルド |
+| `-OutDir <path>` | 出力先 (既定: `dist`) |
+| `-Configuration Debug` | デバッグビルド |
+
+出力:
+
+```
+dist\dskr.exe
+dist\dskr-<version>-windows-x86_64.exe
+dist\dskr-<version>-windows-x86_64.zip          (-Zip 指定時)
+dist\dskr-<version>-windows-x86_64.zip.sha256   (-Zip 指定時)
+```
+
+zip の中身 (バージョン付きフォルダに同梱):
+
+```text
+dskr-<version>-windows-x86_64\
+├── dskr.exe
+├── README.md
+├── USAGE.md
+├── LICENSE
+└── SHA256SUMS.txt
+```
+
+`SHA256SUMS.txt` は `dskr.exe` のハッシュを `sha256sum` 互換の形式で記録します。
+`-Configuration Debug` では zip 名に `-debug` が付き、中の実行ファイルは `dskr-debug.exe` になります。
+
+スクリプトはビルド後に `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行い、SHA-256 とサイズを表示します。
+オフライン環境では、ネットワークのある環境で先に `cargo vendor vendor` を実行し、`.cargo\config.toml` に以下を追加してからフォルダごとコピーしてください。
+
+```toml
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+```
+
+> 実機での手動確認項目: UNC (`\\server\share`) の走査、長いパス (>260 文字)、ジャンクション、
+> OneDrive プレースホルダ、Windows Terminal での Ctrl+C / `q` 後の端末復元。
+> 配布時はコード署名 (SmartScreen 警告の低減) も検討してください。
+
+## 使い方
+
+### 画面で操作する (TUI)
+
+```sh
+dskr /var                 # TUI で探索 (既定)
+dskr                      # カレントディレクトリ
+```
+
+| キー | 動作 |
+|---|---|
+| `↑↓ / j k` | 移動 |
+| `Enter / l` | フォルダを開く |
+| `h / BS` | 一つ上へ (左キーも可) |
+| `g / G` | 先頭 / 末尾 |
+| `s` | 並び順の切替 (サイズ → 名前 → ファイル数 → 更新日時) |
+| `S` | 昇順 / 降順の反転 |
+| `a` | 合計の種類 (ディスク使用量 ⇔ 見かけのサイズ) |
+| `u` | 表示単位の切替 (自動→B→KiB→MiB→…) |
+| `U` | 単位の基準 (IEC = 1024基準 ⇔ SI = 1000基準) |
+| `/` | 名前で絞り込み (Enter 適用 / Esc 解除) |
+| `E` | エラー一覧 (権限拒否など) |
+| `e` | 結果を保存 (形式・件数・深さを指定) |
+| `d` | 選択項目を削除 (`--allow-delete` 指定時のみ) |
+| `?` | 全画面ヘルプ (`j/k`, `PgUp/PgDn` でスクロール) |
+| `q` | 終了 |
+
+既定は **サイズの大きい順** です。`S` を押すと昇順になります。
+隠しファイル・システムファイルは既定では一覧にも合計にも含まれません。表示する場合は起動時に `--hidden` を指定してください。
+画面が十分に広いときは更新日時 (`YYYY-MM-DD HH:MM`) も表示されます。
+走査中は `Space` で一時停止/再開、`Esc` で中止 (途中までの結果をそのまま確認できます)。
+応答しないネットワーク先などで中止が完了しない場合は `q` → `y` で強制終了できます。
+
+`e` を押すと保存設定が開きます。`Tab` / `Shift+Tab` で「形式 → 件数 → 深さ → 保存」を移動し、`←/→` で形式、数字と `↑/↓` で件数・深さを指定します。形式ごとに使わない項目は自動で無効になります。保存先はカレントディレクトリで、既存ファイルは上書きしません。
+
+保存できる形式は、概要レポート / フォルダ構成 / 一覧 / Markdown / HTML / JSON / CSV です。
+
+#### 削除機能 (`--allow-delete`)
+
+既定では削除できません。起動時に `--allow-delete` を指定したときだけ、TUI で `d` による削除が使えます。
+
+```sh
+dskr /data --allow-delete
+```
+
+- 選択項目で `d` を押すと確認ダイアログが開きます
+- ファイル / リンクは `y`、フォルダは `yes` と入力して `Enter` で確定します
+- 削除は**ゴミ箱ではなく完全削除**です。取り消せません
+- フォルダは中身ごと削除されます
+- シンボリックリンク / ジャンクションはリンク先を辿らず、リンク自体だけを削除します
+- 削除に成功すると、画面の一覧と合計を即時更新します
+- `--no-tui` / `--format` / `--json` などの画面なし出力とは併用できません
+
+> **注意**: 削除は元に戻せません。重要なデータは事前にバックアップしてください。
+
+削除の制限と失敗時の挙動:
+
+- 削除できるのは、いま開いているフォルダの子項目だけです。走査ルート自体は削除できません
+- 走査中は削除できません。走査完了後に `d` を押してください
+- `--exclude` / `--min-size` / `--max-depth` / `--max-nodes` などで一覧・集計に出ていない項目も、フォルダ削除では一緒に削除されます
+- 権限がないなどで一部だけ削除された場合はエラーを表示します。画面のツリーは自動で再走査しないため、必要なら dskr を起動し直してください
+- Windows の読み取り専用属性が付いたファイルは削除に失敗します (属性は変更しません)
+- ネットワーク共有上の削除はサーバ側の権限に従います。応答が遅い場合は処理に時間がかかることがあります
+
+### 画面を使わない出力
+
+`--no-tui` を指定すると、既定で**概要レポート**を標準出力へ出します。
+
+```sh
+dskr /var --no-tui                          # 概要レポート
+dskr /var --format tree --depth 2           # フォルダ構成
+dskr /var --format flat --top 50            # du 風フラット一覧
+dskr /var --format markdown --output report.md
+dskr /var --format html --output report.html
+dskr /var --no-tui --json out.json --csv out.csv   # 追加で JSON/CSV も保存
+```
+
+| 形式 | 内容 | 既定の深さ/件数 |
+|---|---|---|
+| `report` | 合計・容量の大きいフォルダ/ファイル・エラー | 上位10件 |
+| `tree` | フォルダ構成 (ルート比%) | 深さ2 / 各階層20件 |
+| `flat` | `サイズ  割合  パス` の一覧 | 上位50件 |
+| `markdown` | 共有用 Markdown レポート | 深さ2 / 上位10件 |
+| `html` | 単一ファイルの HTML (外部参照なし) | 深さ2 / 上位10件 |
+| `json` / `csv` | 機械処理用 (従来形式) | 全件 |
+
+- `--output -` または省略時は標準出力。`--json` / `--csv` はファイル出力
+- `--format` / `--json` / `--csv` を指定すると**自動的に画面なしで出力**(`--no-tui` 不要)
+- 出力の並びは既定で**サイズの大きい順**。`--sort name:asc` などで変更可能
+- `--top 0` は無制限 (巨大な出力になる点に注意)
+- `--depth` はルートを 0 とした深さ
+- `--units iec|si` / `--unit auto|b|kib|mib|…` で表示単位を変更
+- `--ascii` でフォルダ構成の罫線を ASCII に、`--color auto|always|never` で色付けを制御
+- レポート/Markdown/HTML の一覧は「大きい順」で、`--sort` は tree/flat の並びに適用
+
+> 補足: `dskr PATH --no-tui` の既定出力は概要レポートです。
+> `--json` は `--no-tui` なしでも書き出されます。
+
+## 主なオプション
+
+OS ごとの対応状況や詳しい制限は [USAGE.md](USAGE.md) のマトリクスを参照してください。
+
+| オプション | 説明 |
+|---|---|
+| `-l, --load low\|normal\|max` | 負荷の目安 (既定 normal) |
+| `-p, --profile auto\|local\|network` | ローカル/ネットワークの判定 (既定 auto) |
+| `-j, --threads N` | 同時に調べるスレッド数 |
+| `--nice N` | nice 値 (Unix, 0-19) |
+| `--io-priority idle\|low\|normal` | I/O 優先度 (Linux: ioprio, Windows: BELOW_NORMAL + EcoQoS。macOS は nice のみ) |
+| `--max-entries-per-sec N` | 1秒あたりに調べる項目数の上限 (全ワーカー合計、最小50) |
+| `-m, --min-size 10M` | 指定サイズ未満のファイルを集計しない |
+| `-D, --max-depth N` | 指定より深い階層の項目を作らない |
+| `--max-nodes N` | 保持する項目数の上限 (既定 5,000,000) |
+| `-L, --follow-links` | シンボリックリンクを辿る (ループ検出あり。-x / local-only では辿らない) |
+| `--local-only` | ネットワーク上の場所を一切走査しない (リンクも辿らない) |
+| `-x, --one-file-system` | ファイルシステムの境界を越えない (リンクも辿らない) |
+| `-e, --exclude GLOB` | 除外パターン (ファイル名に対する `*` / `?`) |
+| `-H, --hidden` | 隠しファイル・システムファイルも表示 (既定: 非表示) |
+| `--skip-cloud-placeholders` | OneDrive 等のプレースホルダを除外 (Windows) |
+| `--metric auto\|allocated\|logical` | 合計に使うサイズ (allocated=ディスク上の使用量 / logical=見かけのサイズ) |
+| `-f, --format report\|tree\|flat\|markdown\|html\|json\|csv` | 出力形式 |
+| `-o, --output FILE\|-` | 出力先 (省略時は標準出力) |
+| `-d, --depth N` | tree / markdown / html の深さ |
+| `-t, --top N` | 表示する件数 (report/tree/flat/markdown/html。0 で無制限) |
+| `-s, --sort size\|name\|count\|mtime[:asc\|desc]` | 並び順 (既定 size:desc) |
+| `-u, --units iec\|si` | 1024 基準 / 1000 基準 |
+| `-U, --unit auto\|b\|kib\|mib\|gib\|tib\|pib\|eib` | 表示単位 |
+| `-a, --ascii` | フォルダ構成の罫線を ASCII に |
+| `-C, --color auto\|always\|never` | 色付け |
+| `-J, --json FILE` / `-c, --csv FILE` | JSON / CSV の追加出力 |
+| `--pause-on-start` | 一時停止状態で開始 |
+| `--allow-delete` | TUI で選択項目の削除を許可 (確認付きの完全削除。既定は無効) |
+
+主要なオプションには短縮形があります。例: `dskr /var -n -f tree -d 2`、`dskr /data -l low -p network`。
+
+## 負荷を抑えて使う
+
+裏で走らせて PC を重くしたくない場合は:
+
+```sh
+dskr /data --load low              # スレッド CPU/4 (最大8) + nice +10 + I/O idle
+dskr /data --max-entries-per-sec 500 --threads 1
+```
+
+`--load low` のレート上限はローカルでは無制限、ネットワークのみ 2,000 項目/秒です。
+スレッド数・nice・I/O 優先度・レート上限は個別オプションで上書きできます。
+`--pause-on-start` で TUI で確認してから開始することも可能です。
+
+## UNC / ネットワーク共有 (Windows)
+
+```sh
+dskr \\fileserver\share\projects          # 標準 UNC
+dskr \\?\UNC\fileserver\share\data        # 拡張長パス (長パス対応)
+dskr Z:\data                              # ネットワークドライブも自動判定
+dskr \\fileserver\share --load low --max-entries-per-sec 500
+```
+
+- `--profile auto` (既定) では UNC / ネットワークドライブを検出し、ネットワーク向けの設定で動作します
+- ネットワーク越しはサーバの対応状況が異なるため、既定で「見かけのサイズ」を表示します (`a` キーで切替)
+- ジャンクション・シンボリックリンクは既定で辿りません (`--follow-links` 指定時も、同じボリューム内のみ)
+- 認証は OS の既存セッションのみ使用します。パスワードの入力・保存は行いません
+- OneDrive 等のクラウド プレースホルダはダウンロードされません。`--skip-cloud-placeholders` で集計から除外できます
+- 応答しないサーバーでは、中止に時間がかかることがあります。`Esc` で止まらない場合は `q` → `y` で強制終了してください (画面は元に戻ります)
+- ネットワーク上の場所を一切走査したくない場合は `--local-only` を指定してください
+- **信頼できる共有のみ指定してください**。接続自体は OS の認証に従います
+
+## プライバシーとセキュリティ
+
+- 本ツールはインターネットへ通信しません。外部への送信やテレメトリはありません
+- 隠しファイル (`.ssh`、`.env` など) と Windows のシステムファイルは既定で一覧・合計・出力から除外されます。表示するには `--hidden` を指定してください
+- 外部通信が起こり得るのは、UNC パス/ネットワークドライブを指定した場合の OS の SMB アクセスのみです
+- `--local-only` を指定すると、ネットワーク上の場所 (NFS, SMB, sshfs 等) を走査せず、リンクも辿りません
+- `--follow-links` 指定時も `-x` / `--local-only` ではリンクを辿りません。Windows では同じボリューム内のリンク先のみ辿ります
+- 既定は読み取り専用です。`--allow-delete` を指定しない限り、削除・移動・属性変更は行わず、ファイルの中身も開きません
+- `--allow-delete` 指定時の削除は確認ダイアログを経た完全削除です。フォルダは中身ごと削除され、リンクはリンク先を辿りません
+- ファイル名やエラーメッセージの制御文字は表示前に無害化します (端末制御やクリップボード操作を防ぐため)
+- Markdown/HTML はファイル名をエスケープし、HTML は外部 CSS/JS/画像を参照しない単一ファイルです
+- JSON/CSV は制御文字や表計算の数式を無害化します。Unix では 0600 で作成し、シンボリックリンクは辿りません
+- TUI の `e` キーは保存設定で形式・件数・深さを確認してから保存し、既存ファイルを上書きしません
+
+## レポート形式
+
+### 人間向け
+- `report`: 合計と容量の大きいフォルダ/ファイル、エラーのサマリー
+- `tree`: フォルダ構成 (サイズ・ルート比%)
+- `flat`: `サイズ 割合 パス` の一覧
+- `markdown`: 表と折りたたみのフォルダ構成を含む共有用レポート
+- `html`: 単一ファイル。外部参照なし。表はクリックで並べ替え可能
+
+### 機械処理用
+JSON (ツリー全体) と CSV (フラットな行) を出力します。
+
+```json
+{
+  "dskr_version": "0.1.0",
+  "generated_at": "2026-11-25T00:30:04.357Z",
+  "root": "\\\\fileserver\\share",
+  "root_kind": "unc",
+  "profile": "network",
+  "stats": { "entries": 4, "dirs": 3, "errors": 1, "elapsed_ms": 51, "threads": 12 },
+  "options": { "load": "normal", "...": "..." },
+  "errors": [ { "path": "...", "message": "..." } ],
+  "tree": { "name": "…", "type": "dir", "allocated": 0, "logical": 0, "files": 0, "dirs": 0, "children": [ … ] }
+}
+```
+
+CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated`
+
+## パフォーマンス
+
+| 環境 | 結果 |
+|---|---|
+| WSL2 (ext4, 12 スレッド) | 30,538 ファイル / 1.6 秒 (同一環境の `du -s` は 6.2 秒) |
+| 負荷プリセット `low` | スレッドを CPU/4（最大8）に削減。レート上限はネットワークのみ 2,000 項目/秒 |
+
+ネイティブ SSD 環境では並列 `stat` によりさらに高速に動作します。ボトルネックはディスクのメタデータ I/O であり、CPU ではありません。
+
+## 開発
+
+```sh
+cargo test            # 単体 + 統合テスト
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo check --target x86_64-pc-windows-gnu   # Windows クロスコンパイル確認
+cargo check --target aarch64-apple-darwin    # macOS クロスコンパイル確認
+```
+
+通信コードが存在しないことは次のように検証できます。
+
+```sh
+# ネットワーク関連システムコールの実測 (AF_INET の socket/connect が 0 件であること)
+strace -f -e trace=%network ./target/release/dskr /path --no-tui
+# 動的インポートシンボルに通信 API がないこと
+# (socketpair/sendmsg/recvmsg は crossterm の自己パイプ用)
+objdump -T target/release/dskr | grep -E '(^|[[:space:]])(connect|getaddrinfo|sendto|bind|listen|accept|socket)$'
+```
+
+CI (GitHub Actions) は Linux / macOS / Windows のマトリクスでテストし、Windows ランナー上で `\\localhost\C$` を使った UNC スモークテストを実行します。
+
+構成:
+
+```
+src/
+├── main.rs          # エントリ、CLI と TUI/ヘッドレスの振り分け
+├── cli.rs           # clap による引数定義
+├── delete.rs        # TUI からの削除処理 (リンク先は辿らない)
+├── path.rs          # パス種別判定 (UNC)、glob、表示短縮
+├── format.rs        # サイズ単位 (IEC/SI・自動/固定)・件数の表記
+├── sort.rs          # ソート種類/方向の共通ロジック
+├── scan/
+│   ├── engine.rs    # 並列走査、負荷制御 (一時停止/レート制限/優先度)
+│   ├── node.rs      # アリーナ型ツリーと集計
+│   └── platform.rs  # 割当サイズ、ハードリンク判定、優先度適用 (OS別)
+├── app.rs           # TUI 状態
+├── ui.rs            # TUI 描画(列ヘッダー/フッター/ヘルプ)
+├── output/          # report / tree / flat / Markdown / HTML
+└── report.rs        # JSON/CSV エクスポート
+```
+
+## Author
+
+QQK (<https://github.com/QuunQuickKick>)
+
+## ライセンス
+
+MIT License. 詳細は [LICENSE](LICENSE) を参照してください。
+
+Copyright (c) 2026 QQK

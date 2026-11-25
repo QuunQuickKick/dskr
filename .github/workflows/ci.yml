@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: No network client crates
+        run: |
+          if cargo tree --edges normal | grep -Eiq '(^|[^a-z])(reqwest|hyper|ureq|curl|tokio|tonic|trust-dns|hickory)'; then
+            echo "network-capable crate found" >&2
+            exit 1
+          fi
+      - name: No network syscall imports
+        run: |
+          cargo build --release
+          if objdump -T target/release/dskr | grep -E '(^|[[:space:]])(connect|getaddrinfo|getnameinfo|sendto|recvfrom|bind|listen|accept|socket)$'; then
+            echo "network syscall import found" >&2
+            exit 1
+          fi
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo test
+
+  windows-unc-smoke:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: UNC smoke test (local admin share)
+        run: cargo run --release -- "\\localhost\C$\Users" --no-tui --top 5
+      - name: UNC error handling (nonexistent share)
+        run: cargo run --release -- "\\localhost\nosuchshare" --no-tui --top 5 ; if ($LASTEXITCODE -eq 0) { exit 1 } else { exit 0 }
+
+  windows-build-script:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build with build-windows.ps1 (Windows PowerShell 5.1)
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Zip
+      - name: Verify zip contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Test-Path dist)) { throw 'dist が見つかりません' }
+          $zip = Get-ChildItem -Path dist -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw 'zip が見つかりません' }
+
+          $dest = Join-Path $env:RUNNER_TEMP 'dskr-zip-check'
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -Path $zip.FullName -DestinationPath $dest
+
+          $top = @(Get-ChildItem -Path $dest)
+          if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) {
+              throw 'zip 直下はパッケージフォルダ 1 つである必要があります'
+          }
+
+          $packageDir = $top[0].FullName
+          $expected = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'SHA256SUMS.txt') | Sort-Object
+          $actual = @(Get-ChildItem -Path $packageDir | Select-Object -ExpandProperty Name) | Sort-Object
+          $diff = Compare-Object -ReferenceObject $expected -DifferenceObject $actual
+          if ($diff) {
+              throw ('zip の内容が想定と違います: ' + (($diff | ForEach-Object { $_.InputObject }) -join ', '))
+          }
+
+          $sums = @(Get-Content (Join-Path $packageDir 'SHA256SUMS.txt'))
+          $expectedHash = ($sums[0] -split '\s+')[0]
+          $actualHash = (Get-FileHash (Join-Path $packageDir 'dskr.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expectedHash -ne $actualHash) {
+              throw 'SHA256SUMS.txt のハッシュが dskr.exe と一致しません'
+          }
+
+          $zipHashFile = $zip.FullName + '.sha256'
+          if (-not (Test-Path $zipHashFile)) { throw 'zip の .sha256 ファイルがありません' }
+          $recorded = ((Get-Content $zipHashFile) -split '\s+')[0]
+          $zipHash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($recorded -ne $zipHash) { throw 'zip の SHA-256 が一致しません' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dskr-windows
+          path: dist/*
