@@ -89,8 +89,12 @@ dskr-<version>-windows-x86_64\
 ├── README.md
 ├── USAGE.md
 ├── LICENSE
+├── THIRD-PARTY-LICENSES.md
 └── SHA256SUMS.txt
 ```
+
+`THIRD-PARTY-LICENSES.md` には依存クレートのライセンスと著作権表示を記載しています
+(`scripts/gen-licenses.sh` で生成。依存を更新したら再実行してコミットしてください)。
 
 `SHA256SUMS.txt` は `dskr.exe` のハッシュを `sha256sum` 互換の形式で記録します。
 `-Configuration Debug` では zip 名に `-debug` が付き、中の実行ファイルは `dskr-debug.exe` になります。

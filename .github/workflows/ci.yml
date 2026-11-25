@@ -24,6 +24,11 @@ jobs:
             echo "network-capable crate found" >&2
             exit 1
           fi
+      - name: Third-party licenses 一覧が最新であること
+        run: |
+          bash scripts/gen-licenses.sh
+          git diff --exit-code THIRD-PARTY-LICENSES.md
+
       - name: No network syscall imports
         run: |
           cargo build --release
@@ -81,7 +86,7 @@ jobs:
           }
 
           $packageDir = $top[0].FullName
-          $expected = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'SHA256SUMS.txt') | Sort-Object
+          $expected = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md', 'SHA256SUMS.txt') | Sort-Object
           $actual = @(Get-ChildItem -Path $packageDir | Select-Object -ExpandProperty Name) | Sort-Object
           $diff = Compare-Object -ReferenceObject $expected -DifferenceObject $actual
           if ($diff) {

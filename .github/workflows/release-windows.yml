@@ -20,6 +20,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: 第三者ライセンス一覧の生成
+        shell: bash
+        run: bash scripts/gen-licenses.sh
+
       - name: タグと Cargo.toml のバージョン整合チェック
         shell: pwsh
         run: |
@@ -65,7 +69,7 @@ jobs:
           if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) {
             throw 'zip 直下はパッケージフォルダ 1 つである必要があります'
           }
-          $expectedFiles = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'SHA256SUMS.txt') | Sort-Object
+          $expectedFiles = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md', 'SHA256SUMS.txt') | Sort-Object
           $actualFiles = @(Get-ChildItem $top[0].FullName | Select-Object -ExpandProperty Name) | Sort-Object
           $diff = Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles
           if ($diff) {
