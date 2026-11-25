@@ -1,0 +1,83 @@
+name: Release (Windows)
+
+# v0.1.1 のようなタグを push すると、scripts/build-windows.ps1 -Zip で
+# 配布用 zip をビルドし、GitHub Release に添付して公開する。
+# テスト (cargo test) は ci.yml が 3 OS で実施するため、ここでは省略する。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-zip:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: タグと Cargo.toml のバージョン整合チェック
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "タグ名は vX.Y.Z 形式で指定してください: $tag"
+          }
+          $version = ''
+          foreach ($line in Get-Content -Path Cargo.toml) {
+            if ($line -match '^version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+              break
+            }
+          }
+          if ($tag -ne "v$version") {
+            throw "タグ ($tag) と Cargo.toml のバージョン (v$version) が一致しません"
+          }
+          Write-Host "バージョン整合 OK: $tag"
+
+      - name: ビルドと zip 作成
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Zip
+
+      - name: 成果物の検証
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $zip = Join-Path 'dist' ("dskr-$version-windows-x86_64.zip")
+          if (-not (Test-Path $zip)) { throw "zip が見つかりません: $zip" }
+          $hashFile = "$zip.sha256"
+          if (-not (Test-Path $hashFile)) { throw "SHA-256 ファイルが見つかりません: $hashFile" }
+          $expected = ((Get-Content $hashFile -First 1) -split '\s+')[0]
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw 'zip の SHA-256 が一致しません' }
+
+          # zip 直下はバージョン付きフォルダ 1 つで、同梱物は 5 ファイル
+          $dest = Join-Path $env:RUNNER_TEMP 'release-zip-check'
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dest
+          $top = @(Get-ChildItem $dest)
+          if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) {
+            throw 'zip 直下はパッケージフォルダ 1 つである必要があります'
+          }
+          $expectedFiles = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'SHA256SUMS.txt') | Sort-Object
+          $actualFiles = @(Get-ChildItem $top[0].FullName | Select-Object -ExpandProperty Name) | Sort-Object
+          $diff = Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles
+          if ($diff) {
+            throw ('zip の内容が不正です: ' + (($diff | ForEach-Object { $_.InputObject }) -join ', '))
+          }
+          Write-Host "検証 OK: $zip"
+
+      - name: GitHub Release を作成して zip を添付
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create "$env:GITHUB_REF_NAME" --title "$env:GITHUB_REF_NAME" --generate-notes "dist/*.zip" "dist/*.zip.sha256"
+          Write-Host "リリースを作成しました: https://github.com/$($env:GITHUB_REPOSITORY)/releases/tag/$($env:GITHUB_REF_NAME)"

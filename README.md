@@ -95,6 +95,19 @@ dskr-<version>-windows-x86_64\
 `SHA256SUMS.txt` は `dskr.exe` のハッシュを `sha256sum` 互換の形式で記録します。
 `-Configuration Debug` では zip 名に `-debug` が付き、中の実行ファイルは `dskr-debug.exe` になります。
 
+### GitHub Releases での配布
+
+`v0.1.1` のようなタグを push すると、GitHub Actions が自動で上記と同じ内容の
+zip をビルドし、GitHub Releases に公開します (ワークフロー: `.github/workflows/release-windows.yml`)。
+
+```sh
+git push origin main
+git tag v0.1.1        # Cargo.toml の version と一致させること
+git push origin v0.1.1
+```
+
+タグ名と `Cargo.toml` の `version` が一致しない場合は失敗します。
+
 スクリプトはビルド後に `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行い、SHA-256 とサイズを表示します。
 オフライン環境では、ネットワークのある環境で先に `cargo vendor vendor` を実行し、`.cargo\config.toml` に以下を追加してからフォルダごとコピーしてください。
 
