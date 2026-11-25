@@ -143,13 +143,36 @@ fn follow_links_dedups_already_scanned_dir() {
     c.follow_links = true;
     let out = scan(dir.path(), c);
     let root = out.tree.node(out.tree.root);
-    // 同一実体は 1 回だけ計上する (sub と link のどちらを辿るかは順序依存)。
-    // 辿られなかった側は自身のメタデータサイズ (リンク長またはディレクトリ長) のみ。
-    assert_eq!(root.file_count, 1);
-    assert!(
-        root.total_logical < 200,
-        "subtree was counted twice: {}",
-        root.total_logical
+    // 同一実体は 1 回だけ計上する。sub と link のどちらを先に辿るかは
+    // readdir の順序に依存するため、どちらの場合でも成り立つ形で検証する。
+    assert_eq!(root.file_count, 1, "同じ実体のファイルは 1 回だけ計上");
+
+    let sub_idx = child(&out, "sub").expect("sub がありません");
+    let link_idx = child(&out, "link").expect("link がありません");
+    let (sub_files, link_files) = (
+        out.tree.node(sub_idx).file_count,
+        out.tree.node(link_idx).file_count,
+    );
+    assert_eq!(
+        sub_files + link_files,
+        1,
+        "サブツリーが二重計上されています (sub={sub_files}, link={link_files})"
+    );
+
+    let (counted, skipped) = if sub_files == 1 {
+        (out.tree.node(sub_idx), out.tree.node(link_idx))
+    } else {
+        (out.tree.node(link_idx), out.tree.node(sub_idx))
+    };
+    assert_eq!(counted.kind, dskr::scan::NodeKind::Dir);
+    assert_eq!(counted.total_logical, 100, "サブツリーの合計は 1 回分");
+    assert_eq!(skipped.kind, dskr::scan::NodeKind::Other);
+    assert_eq!(skipped.file_count, 0);
+    assert!(skipped.children.is_empty(), "辿られない側は中身を持たない");
+    assert_eq!(
+        root.total_logical,
+        100 + skipped.total_logical,
+        "辿られない側は自身のメタデータサイズのみを加算する"
     );
 }
 
