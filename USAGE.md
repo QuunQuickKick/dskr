@@ -2,7 +2,7 @@
 
 `dskr` は、指定したディレクトリ配下のディスク使用量を高速に調べるツールです。この文書は利用者向けの詳細ガイドです。概要やビルド方法は [README.md](README.md)、サイズの数え方や `du` との違いは [ACCURACY.md](ACCURACY.md) を参照してください。
 
-- 対象バージョン: 0.2.0
+- 対象バージョン: 0.3.0
 - 対象 OS: Windows / macOS / Linux
 - `dskr --help` は、実行する OS に合わせた説明と例を表示します
 
@@ -250,7 +250,7 @@ dskr /var --no-tui --json out.json --csv out.csv
 - `--color auto|always|never` で色付けを制御します
 - 「走査: N 項目」の項目数は、隠しファイルの除外・`--min-size` / `--exclude` / `--max-depth` で集計から外した項目も含む「調べた項目数」です
 
-JSON はツリー全体を、CSV はフラットな行を出力します。JSON / CSV は制御文字や表計算の数式を無害化します。JSON の `incomplete` は取得できなかった項目があること、`errors_truncated` はエラー一覧が上限 (1000件) を超えて省略されていることを示します。`allocated_collected` が false のとき、`allocated` は実際の割当サイズではありません。`mtime` は取得できない場合 `null` です。CSV の各行には、スキャン全体の状態として `cancelled` / `scan_truncated` / `scan_errors` / `allocated_collected` も入ります。
+JSON はツリー全体を、CSV はフラットな行を出力します。JSON / CSV は制御文字や表計算の数式を無害化します。JSON の `incomplete` は取得できなかった項目があること、`errors_truncated` はエラー一覧が上限 (1000件) を超えて省略されていることを示します。`allocated_collected` が false のとき、`allocated` は実際の割当サイズではありません。`mtime` は取得できない場合 `null` です。`schema_version` は公開スキーマのバージョン、`blocked_folders` は対象外フォルダ数です。CSV の各行には、スキャン全体の状態として `cancelled` / `scan_truncated` / `scan_errors` / `allocated_collected` / `scan_blocked` / `schema_version` も入ります。
 
 `-x` や `--local-only` で走査しないと決めたフォルダは、一覧では `(対象外)` と表示され、JSON の `"type"` は `"blocked"` になります (中身は集計されません)。
 

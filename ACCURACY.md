@@ -3,7 +3,7 @@
 この文書は、dskr が「サイズ」をどう数えているか、どのような場合に `du` などの
 ツールと一致しないかを説明します。
 
-対象バージョン: 0.2.0
+対象バージョン: 0.3.0
 
 ## 1. 2つのサイズ
 
@@ -152,10 +152,12 @@ APFS のクローンや Btrfs / XFS の reflink は、複数ファイルが同�
 
 JSON:
 
+- `schema_version`
 - `cancelled`
 - `truncated`
 - `incomplete`
 - `errors_truncated`
+- `blocked_folders`
 - `allocated_collected`
 - `mtime` (`null` 可)
 
@@ -166,6 +168,8 @@ CSV の各行:
 - `scan_truncated` (スキャン全体)
 - `scan_errors` (スキャン全体)
 - `allocated_collected` (スキャン全体)
+- `scan_blocked` (スキャン全体)
+- `schema_version`
 
 ## 12. 精度に関する既知の制約
 
@@ -176,3 +180,19 @@ CSV の各行:
 - 走査中にファイルが変更された場合、結果は各メタデータ取得時点の
   スナップショットです。
 - ファイルシステムや OS が報告するメタデータの精度を超えることはできません。
+
+## 13. 0.3.0 の決定事項
+
+以下は 0.3.0 時点の仕様として確定します。
+
+| 項目 | 決定 |
+|---|---|
+| ディレクトリ自身の割当ブロック | 合計に含めない |
+| APFS クローン / Btrfs・XFS reflink | 共有ブロックの重複排除をしない |
+| ハードリンクの allocated | 実体ごとに1回 |
+| ハードリンクの logical | パスごとに加算 |
+| `--follow-links` で辿ったリンクの削除 | 拒否する |
+| Windows ネットワークの allocated | 取得しない (`allocated_collected=false`) |
+
+これらの変更は、数値の意味が変わるため、将来変更する場合はマイナーバージョン
+アップとして扱います。

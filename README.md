@@ -327,7 +327,8 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 
 ```json
 {
-  "dskr_version": "0.2.0",
+  "schema_version": 1,
+  "dskr_version": "0.3.0",
   "generated_at": "2026-11-25T00:30:04.357Z",
   "root": "\\\\fileserver\\share",
   "root_kind": "unc",
@@ -338,6 +339,7 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
   "truncated": false,
   "incomplete": true,
   "errors_truncated": false,
+  "blocked_folders": 0,
   "stats": { "entries": 4, "dirs": 3, "errors": 1, "elapsed_ms": 51, "threads": 12 },
   "options": { "load": "normal", "...": "..." },
   "errors": [ { "path": "...", "message": "..." } ],
@@ -347,9 +349,11 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 
 `tree` の `type` は `dir` / `file` / `other` (リンク・特殊ファイル) / `blocked` (`-x` や `--local-only` で走査しないフォルダ。中身は集計されない) のいずれかです。
 
-`incomplete` は、権限不足や列挙中エラーなどで取得できなかった項目があることを示します。`errors_truncated` は、エラー一覧が上限 (1000件) を超えて省略されていることを示します。`allocated_collected` が false のとき、`allocated` は実際の割当サイズではありません (Windows のネットワークプロファイルなど)。`mtime` は取得できない場合 `null` になります。
+`incomplete` は、権限不足や列挙中エラーなどで取得できなかった項目があることを示します。`errors_truncated` は、エラー一覧が上限 (1000件) を超えて省略されていることを示します。`allocated_collected` が false のとき、`allocated` は実際の割当サイズではありません (Windows のネットワークプロファイルなど)。`mtime` は取得できない場合 `null` になります。`schema_version` は JSON / CSV の公開スキーマのバージョン、`blocked_folders` は `-x` / `--local-only` で対象外にしたフォルダ数です。
 
-CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected`
+CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected,scan_blocked,schema_version`
+- `scan_blocked` はスキャン全体の対象外フォルダ数、`schema_version` は公開スキーマのバージョンです。
+- パス区切りは実行 OS のネイティブ表記です。
 
 ## パフォーマンス
 
