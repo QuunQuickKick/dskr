@@ -348,6 +348,7 @@ fn headless(
 ) -> Result<u32, String> {
     let cfg_root = cfg.root.clone();
     let want_allocated = cfg.want_allocated;
+    let allocated_collected = !cfg!(windows) || want_allocated || !cfg.network;
     let outcome = run(cfg, progress, control);
     let metric = if want_allocated {
         "allocated"
@@ -362,6 +363,7 @@ fn headless(
         threads,
         options_json,
         metric,
+        allocated_collected,
     );
 
     let explicit_format = cli.format.map(to_output_format);

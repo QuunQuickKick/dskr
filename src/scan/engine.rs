@@ -91,6 +91,34 @@ impl Default for Control {
     }
 }
 
+/// テスト専用: 指定ディレクトリの ReadDir を途中で失敗させる。
+#[cfg(test)]
+mod readdir_fault {
+    use super::*;
+
+    static FAULT: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+
+    pub(super) fn arm(path: &Path, after: usize) {
+        *lock(&FAULT) = Some((path.to_path_buf(), after));
+    }
+
+    pub(super) fn should_fail(path: &Path) -> bool {
+        let mut guard = lock(&FAULT);
+        let Some((target, remaining)) = guard.as_mut() else {
+            return false;
+        };
+        if target != path {
+            return false;
+        }
+        if *remaining == 0 {
+            *guard = None;
+            return true;
+        }
+        *remaining -= 1;
+        false
+    }
+}
+
 #[derive(Default)]
 pub struct Progress {
     pub entries: AtomicU64,
@@ -144,6 +172,7 @@ pub struct EngineConfig {
     pub local_only: bool,
 }
 
+#[derive(Debug)]
 pub struct ScanError {
     pub path: String,
     pub message: String,
@@ -152,6 +181,9 @@ pub struct ScanError {
 pub struct ScanOutcome {
     pub tree: Tree,
     pub errors: Vec<ScanError>,
+    /// 2 本以上のパスが存在するハードリンクのグループ (node index)。
+    /// 削除時に allocated の計上先を残存リンクへ移すために使う。
+    pub hardlink_groups: HashMap<(u64, u64), Vec<u32>>,
     pub truncated: bool,
     pub cancelled: bool,
     pub entries: u64,
@@ -178,12 +210,14 @@ struct Shared {
     pending: AtomicU64,
     tree: Arc<Mutex<Tree>>,
     hardlinks: Mutex<HashMap<(u64, u64), ()>>,
+    /// 実際に重複するハードリンクの node 一覧 (スキャン完了後に確定)。
+    hardlink_groups: Mutex<HashMap<(u64, u64), Vec<u32>>>,
     visited: Mutex<HashSet<(u64, u64)>>,
     progress: Arc<Progress>,
     control: Arc<Control>,
     pacer: Pacer,
     errors: Arc<Mutex<Vec<ScanError>>>,
-    root_volume: u64,
+    root_volume: Option<u64>,
     /// ルートのドライブレター (Windows のリンク越境判定用)
     #[cfg_attr(not(windows), allow(dead_code))]
     root_drive: Option<u8>,
@@ -242,6 +276,15 @@ impl Pacer {
     }
 }
 
+/// ルートと対象が同一ボリュームか。どちらかが不明なら一致とみなさない。
+/// 不明値を 0 などの実在し得る値に読み替えないためのヘルパ。
+fn same_volume(root: Option<u64>, volume: Option<u64>) -> bool {
+    match (root, volume) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// ルートパスのドライブレター (Windows のみ)。
 fn root_drive_of(p: &Path) -> Option<u8> {
     #[cfg(windows)]
@@ -276,7 +319,7 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
 
     let root_md = fs::metadata(&fs_root).ok();
     let root_mtime = root_md.as_ref().map(platform::mtime_secs).unwrap_or(0);
-    let root_volume = platform::volume_of(&fs_root).unwrap_or(0);
+    let root_volume = platform::volume_of(&fs_root);
 
     let tree_arc = Arc::new(Mutex::new(Tree::with_root(
         cfg.root.as_os_str().to_owned(),
@@ -300,6 +343,7 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         pending: AtomicU64::new(0),
         tree: tree_arc,
         hardlinks: Mutex::new(HashMap::new()),
+        hardlink_groups: Mutex::new(HashMap::new()),
         visited: Mutex::new(visited),
         progress: progress.clone(),
         control: control.clone(),
@@ -311,6 +355,14 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         netfs_cache: Mutex::new(HashMap::new()),
         cfg,
     });
+
+    if shared.root_volume.is_none() && (shared.cfg.one_file_system || shared.cfg.local_only) {
+        shared.record_error(
+            Path::new("<volume>"),
+            "ルートのボリュームを取得できないため、-x / --local-only の境界判定を適用できません (走査はルートのみ)".into(),
+            None,
+        );
+    }
 
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -375,10 +427,19 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         .map(|m| m.into_inner().unwrap_or_else(PoisonError::into_inner))
         .expect("scan: tree");
     tree.aggregate();
+    // max_depth だけでなく、max_nodes による打ち切りもノード単位で立つ。
+    // 全体レポートの truncated に反映する。
+    let tree_truncated = tree.nodes.iter().any(|n| n.truncated);
     let errors = Arc::try_unwrap(shared.errors)
         .ok()
         .map(|m| m.into_inner().unwrap_or_else(PoisonError::into_inner))
         .expect("scan: errors");
+    let mut hardlink_groups = shared
+        .hardlink_groups
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    // 走査範囲内で実際に 2 本以上見つかったものだけを残す。
+    hardlink_groups.retain(|_, nodes| nodes.len() > 1);
 
     ScanOutcome {
         entries: shared.progress.entries.load(Ordering::Relaxed),
@@ -389,7 +450,8 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         elapsed: shared.progress.elapsed(),
         tree,
         errors,
-        truncated: shared.truncated.load(Ordering::Relaxed),
+        hardlink_groups,
+        truncated: shared.truncated.load(Ordering::Relaxed) || tree_truncated,
         cancelled,
         root: shared.cfg.root.clone(),
     }
@@ -462,9 +524,9 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
         }
     };
 
-    let mut batch: Vec<Node> = Vec::new();
+    let mut batch: Vec<(Node, Option<(u64, u64)>)> = Vec::new();
 
-    for entry in rd.flatten() {
+    for entry_result in rd {
         if sh.control.state() == ControlState::Cancelling {
             break;
         }
@@ -474,6 +536,25 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 break;
             }
         }
+        #[cfg(test)]
+        let entry_result = if readdir_fault::should_fail(&path) {
+            Err(std::io::Error::other("injected readdir error"))
+        } else {
+            entry_result
+        };
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(e) => {
+                // エントリ名は得られないため、列挙に失敗したディレクトリを記録する。
+                // このエラーを無視すると、取得できなかった項目が無通知で欠落する。
+                sh.record_error(
+                    &path,
+                    format!("ディレクトリ列挙中にエラー: {e}"),
+                    Some(node),
+                );
+                continue;
+            }
+        };
         sh.pacer.acquire();
         sh.progress.entries.fetch_add(1, Ordering::Relaxed);
 
@@ -521,22 +602,23 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 None
             };
             if !sh.dir_allowed(&child_path, volume, false) {
-                batch.push(Node::blocked(
-                    name,
-                    node,
-                    depth + 1,
-                    platform::mtime_secs(&md),
+                batch.push((
+                    Node::blocked(name, node, depth + 1, platform::mtime_secs(&md)),
+                    None,
                 ));
                 continue;
             }
             if sh.cfg.follow_links && !sh.mark_visited(&md, &child_path) {
-                batch.push(Node::other(
-                    name,
-                    node,
-                    depth + 1,
-                    0,
-                    md.len(),
-                    platform::mtime_secs(&md),
+                batch.push((
+                    Node::other(
+                        name,
+                        node,
+                        depth + 1,
+                        0,
+                        md.len(),
+                        platform::mtime_secs(&md),
+                    ),
+                    None,
                 ));
                 continue;
             }
@@ -568,13 +650,13 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
             // リンク先のメタデータ取得自体が別FS (ネットワーク等) への
             // アクセスになり得るため。
             if sh.cfg.local_only || sh.cfg.one_file_system {
-                batch.push(leaf());
+                batch.push((leaf(), None));
                 continue;
             }
             // Windows: リンク先が別ドライブ/UNC なら辿らない (read_link は外部に触れない)
             #[cfg(windows)]
             if platform::link_leaves_volume(&child_path, sh.root_drive) {
-                batch.push(leaf());
+                batch.push((leaf(), None));
                 continue;
             }
             let volume = if sh.wants_volume(true) {
@@ -583,17 +665,17 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 None
             };
             if sh.link_cross_blocked(volume) {
-                batch.push(leaf());
+                batch.push((leaf(), None));
                 continue;
             }
             match fs::metadata(&child_path) {
                 Ok(tmd) if tmd.is_dir() => {
                     if !sh.dir_allowed(&child_path, volume, true) {
-                        batch.push(leaf());
+                        batch.push((leaf(), None));
                         continue;
                     }
                     if !sh.mark_visited(&tmd, &child_path) {
-                        batch.push(leaf());
+                        batch.push((leaf(), None));
                         continue;
                     }
                     if !sh.queue_dir(
@@ -616,15 +698,29 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 }
             }
         } else {
-            batch.push(leaf());
+            batch.push((leaf(), None));
         }
     }
 
     if !batch.is_empty() {
-        let mut t = lock(&sh.tree);
-        for n in batch {
-            if sh.push_locked(&mut t, node, n).is_none() {
-                break;
+        let mut links: Vec<(u32, (u64, u64))> = Vec::new();
+        {
+            let mut t = lock(&sh.tree);
+            for (n, hardlink) in batch {
+                match sh.push_locked(&mut t, node, n) {
+                    Some(idx) => {
+                        if let Some(key) = hardlink {
+                            links.push((idx, key));
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        if !links.is_empty() {
+            let mut groups = lock(&sh.hardlink_groups);
+            for (idx, key) in links {
+                groups.entry(key).or_default().push(idx);
             }
         }
     }
@@ -648,27 +744,32 @@ impl Shared {
         let _ = child;
         if self.cfg.local_only {
             #[cfg(windows)]
-            if volume != Some(self.root_volume) {
+            if !same_volume(self.root_volume, volume) {
                 return false;
             }
             #[cfg(not(windows))]
             {
-                let vol = volume.unwrap_or(0);
-                let cached = lock(&self.netfs_cache).get(&vol).copied();
-                let net = match cached {
-                    Some(v) => v,
-                    None => {
-                        let n = platform::is_network_fs(child);
-                        lock(&self.netfs_cache).insert(vol, n);
-                        n
+                let net = match volume {
+                    Some(vol) => {
+                        let cached = lock(&self.netfs_cache).get(&vol).copied();
+                        match cached {
+                            Some(v) => v,
+                            None => {
+                                let n = platform::is_network_fs(child);
+                                lock(&self.netfs_cache).insert(vol, n);
+                                n
+                            }
+                        }
                     }
+                    // ボリュームIDが不明な場合はキャッシュせず都度判定する。
+                    None => platform::is_network_fs(child),
                 };
                 if net {
                     return false;
                 }
             }
         }
-        if self.cfg.one_file_system && volume != Some(self.root_volume) {
+        if self.cfg.one_file_system && !same_volume(self.root_volume, volume) {
             return false;
         }
         if is_link {
@@ -676,7 +777,7 @@ impl Shared {
                 || self.cfg.local_only
                 || self.cfg.network
                 || cfg!(windows);
-            if restrict && volume != Some(self.root_volume) {
+            if restrict && !same_volume(self.root_volume, volume) {
                 return false;
             }
         }
@@ -687,7 +788,7 @@ impl Shared {
     fn link_cross_blocked(&self, volume: Option<u64>) -> bool {
         let restrict =
             self.cfg.one_file_system || self.cfg.local_only || self.cfg.network || cfg!(windows);
-        restrict && volume != Some(self.root_volume)
+        restrict && !same_volume(self.root_volume, volume)
     }
 
     /// リンク追従時の重複・循環検出。初出なら true。
@@ -709,7 +810,7 @@ impl Shared {
     /// 追加した場合は true を返す。
     fn add_file(
         &self,
-        batch: &mut Vec<Node>,
+        batch: &mut Vec<(Node, Option<(u64, u64)>)>,
         name: OsString,
         parent: u32,
         depth: u16,
@@ -724,8 +825,18 @@ impl Shared {
             return false;
         }
         // 割当サイズとハードリンクキー (Windows では 1 回のハンドルオープンで両方)。
-        let info =
-            platform::file_size_info(md, path, self.cfg.want_allocated, self.want_hardlink());
+        // Windows ローカルでは表示が logical でも allocated を取得しておく。
+        // そうしないと TUI の「ディスク使用量」切替や JSON の allocated が
+        // 見かけのサイズになってしまう。ネットワークでは余計な往復を避ける。
+        let collect_alloc = self.cfg.want_allocated || (cfg!(windows) && !self.cfg.network);
+        let info = platform::file_size_info(md, path, collect_alloc, self.want_hardlink());
+        if collect_alloc && !info.alloc_exact {
+            self.record_error(
+                path,
+                "割当サイズを取得できないため、見かけのサイズで代替しました".into(),
+                Some(parent),
+            );
+        }
         let own_alloc = match info.hardlink {
             Some(key) => {
                 let mut m = lock(&self.hardlinks);
@@ -738,13 +849,16 @@ impl Shared {
             }
             None => info.alloc,
         };
-        batch.push(Node::file(
-            name,
-            parent,
-            depth,
-            own_alloc,
-            logical,
-            platform::mtime_secs(md),
+        batch.push((
+            Node::file(
+                name,
+                parent,
+                depth,
+                own_alloc,
+                logical,
+                platform::mtime_secs(md),
+            ),
+            info.hardlink,
         ));
         self.progress
             .bytes_alloc
@@ -818,5 +932,131 @@ impl Shared {
             let mut t = lock(&self.tree);
             t.nodes[n as usize].err_count += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn cfg(root: &Path) -> EngineConfig {
+        EngineConfig {
+            root: root.to_path_buf(),
+            follow_links: false,
+            one_file_system: false,
+            excludes: Vec::new(),
+            include_hidden: false,
+            min_size: 0,
+            max_depth: None,
+            max_nodes: MAX_NODES_DEFAULT,
+            threads: 1,
+            rate_limit: 0,
+            skip_cloud_placeholders: false,
+            want_allocated: true,
+            skip_pseudo: false,
+            network: false,
+            local_only: false,
+        }
+    }
+
+    #[test]
+    fn volume_comparison_requires_known_values() {
+        assert!(same_volume(Some(1), Some(1)));
+        assert!(!same_volume(Some(1), Some(2)));
+        assert!(!same_volume(None, Some(1)));
+        assert!(!same_volume(Some(1), None));
+        assert!(!same_volume(None, None));
+    }
+
+    fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn pause_resume_and_cancel_are_observed() {
+        let dir = tempdir().unwrap();
+        for i in 0..500 {
+            fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
+        }
+
+        let mut c = cfg(dir.path());
+        c.threads = 1;
+        c.rate_limit = 100; // 20 トークン / 200ms。500件では数秒かかる。
+        let progress = Arc::new(Progress::new());
+        let control = Arc::new(Control::new());
+        let p = progress.clone();
+        let ctl = control.clone();
+        let handle = std::thread::spawn(move || run(c, p, ctl));
+
+        assert!(
+            wait_until(
+                || progress.entries.load(Ordering::Relaxed) >= 10,
+                Duration::from_secs(2)
+            ),
+            "走査が開始されませんでした"
+        );
+
+        control.pause();
+        std::thread::sleep(Duration::from_millis(150));
+        let paused = progress.entries.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+        let after_pause = progress.entries.load(Ordering::Relaxed);
+        assert!(
+            after_pause <= paused + 2,
+            "一時停止中に走査が進みました: {paused} -> {after_pause}"
+        );
+
+        control.resume();
+        assert!(
+            wait_until(
+                || progress.entries.load(Ordering::Relaxed) > after_pause,
+                Duration::from_secs(2)
+            ),
+            "再開後に走査が進みませんでした"
+        );
+
+        control.cancel();
+        let out = handle.join().unwrap();
+        assert!(out.cancelled, "中止が ScanOutcome に反映されていません");
+    }
+
+    #[test]
+    fn readdir_iteration_error_is_recorded_and_scan_continues() {
+        let dir = tempdir().unwrap();
+        for i in 0..6 {
+            fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
+        }
+
+        readdir_fault::arm(dir.path(), 2);
+        let out = run(
+            cfg(dir.path()),
+            Arc::new(Progress::new()),
+            Arc::new(Control::new()),
+        );
+
+        assert!(out.error_count >= 1, "列挙中エラーが記録されていません");
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.path == dir.path().to_string_lossy()),
+            "列挙に失敗したディレクトリが errors にありません: {:?}",
+            out.errors
+        );
+        assert!(
+            out.tree.node(out.tree.root).file_count < 6,
+            "エラー後のエントリまで数えられています"
+        );
+        assert!(
+            out.tree.node(out.tree.root).file_count >= 1,
+            "エラー後も走査を継続していません"
+        );
     }
 }

@@ -151,6 +151,34 @@ mod tests {
         assert!(target.join("keep.txt").exists());
     }
 
+    #[test]
+    fn refuses_directory_delete_when_target_is_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"x").unwrap();
+
+        let err = remove_target(&victim, NodeKind::Dir).unwrap_err();
+        assert!(err.contains("フォルダではなく"), "{err}");
+        assert!(victim.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_symlink_recorded_as_file_without_following_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        remove_target(&link, NodeKind::File).unwrap();
+
+        assert!(!link.exists());
+        assert!(target.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn blocked_kind_refuses_recursive_delete() {

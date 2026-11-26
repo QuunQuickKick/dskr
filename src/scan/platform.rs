@@ -16,7 +16,11 @@ use crate::cli::IoPriority;
 pub struct FileSizeInfo {
     /// ディスク上の占有量 (割当サイズ)。
     pub alloc: u64,
-    /// 同一実体の判定キー。取得できない場合は None。
+    /// `alloc` が実際の割当サイズとして取得できたか。
+    /// false のときは見かけのサイズなどで代替している。
+    pub alloc_exact: bool,
+    /// 同一実体の判定キー。ハードリンク数が 2 以上のファイルのみ設定される。
+    /// 取得できない、または重複排除が不要な場合は None。
     pub hardlink: Option<(u64, u64)>,
 }
 
@@ -39,7 +43,10 @@ pub fn file_size_info(
         let _ = want_alloc;
         FileSizeInfo {
             alloc: md.blocks().saturating_mul(512),
-            hardlink: if want_hardlink && md.is_file() {
+            alloc_exact: true,
+            // リンク数 1 のファイルは重複排除の対象外。キーを保持しないことで
+            // スキャン後のハードリンクグループも実際の重複だけに限定する。
+            hardlink: if want_hardlink && md.is_file() && md.nlink() > 1 {
                 Some((md.dev(), md.ino()))
             } else {
                 None
@@ -51,6 +58,7 @@ pub fn file_size_info(
         if !want_alloc && !want_hardlink {
             return FileSizeInfo {
                 alloc: md.len(),
+                alloc_exact: false,
                 hardlink: None,
             };
         }
@@ -72,14 +80,19 @@ fn fallback_size_info(
     want_alloc: bool,
     want_hardlink: bool,
 ) -> FileSizeInfo {
+    let (alloc, alloc_exact) = if want_alloc {
+        match get_compressed_size(path) {
+            Some(a) => (a, true),
+            None => (md.len(), false),
+        }
+    } else {
+        (md.len(), false)
+    };
     FileSizeInfo {
-        alloc: if want_alloc {
-            get_compressed_size(path).unwrap_or_else(|| md.len())
-        } else {
-            md.len()
-        },
+        alloc,
+        alloc_exact,
         hardlink: if want_hardlink {
-            file_info_by_handle(path)
+            hardlink_info_by_handle(path)
         } else {
             None
         },
@@ -142,10 +155,14 @@ fn file_size_info_by_handle(
             }
             return None;
         }
-        hardlink = Some((info.dwVolumeSerialNumber as u64, index));
+        // リンク数 1 のファイルは重複排除の対象外。
+        if info.nNumberOfLinks > 1 {
+            hardlink = Some((info.dwVolumeSerialNumber as u64, index));
+        }
     }
 
     let mut alloc = md.len();
+    let mut alloc_exact = false;
     if want_alloc {
         let mut comp: FILE_COMPRESSION_INFO = unsafe { std::mem::zeroed() };
         let ok = unsafe {
@@ -170,17 +187,33 @@ fn file_size_info_by_handle(
             return None;
         }
         alloc = a;
+        alloc_exact = true;
     } else {
         unsafe {
             let _ = CloseHandle(handle);
         }
     }
 
-    Some(FileSizeInfo { alloc, hardlink })
+    Some(FileSizeInfo {
+        alloc,
+        alloc_exact,
+        hardlink,
+    })
 }
 
 #[cfg(windows)]
 fn file_info_by_handle(path: &Path) -> Option<(u64, u64)> {
+    handle_file_info(path, false)
+}
+
+/// ハードリンクの重複排除用キー。リンク数 1 のファイルは None。
+#[cfg(windows)]
+fn hardlink_info_by_handle(path: &Path) -> Option<(u64, u64)> {
+    handle_file_info(path, true)
+}
+
+#[cfg(windows)]
+fn handle_file_info(path: &Path, hardlink_only: bool) -> Option<(u64, u64)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -208,6 +241,9 @@ fn file_info_by_handle(path: &Path) -> Option<(u64, u64)> {
         let _ = CloseHandle(handle);
     }
     if ok == 0 || info.dwVolumeSerialNumber == 0 {
+        return None;
+    }
+    if hardlink_only && info.nNumberOfLinks <= 1 {
         return None;
     }
     let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
@@ -407,7 +443,7 @@ pub fn is_cloud_placeholder(_md: &Metadata) -> bool {
     false
 }
 
-/// mtime をエポック秒へ (失敗時 0)。
+/// mtime をエポック秒へ (取得できない場合は 0。JSON では null になる)。
 pub fn mtime_secs(md: &Metadata) -> i64 {
     use std::time::UNIX_EPOCH;
     md.modified()
@@ -655,6 +691,25 @@ mod tests {
         assert!(!is_hidden_name(OsStr::new("env")));
         assert!(!is_hidden_name(OsStr::new("a.env")));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_allocation_is_exact_and_hardlink_key_requires_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a");
+        std::fs::write(&file, b"x").unwrap();
+        let md = std::fs::metadata(&file).unwrap();
+        let info = file_size_info(&md, &file, true, true);
+        assert!(info.alloc_exact);
+        assert_eq!(info.hardlink, None, "リンク数1ではキーを作らない");
+
+        let twin = dir.path().join("b");
+        std::fs::hard_link(&file, &twin).unwrap();
+        let md = std::fs::metadata(&file).unwrap();
+        let info = file_size_info(&md, &file, true, true);
+        assert!(info.alloc_exact);
+        assert!(info.hardlink.is_some(), "ハードリンクではキーを作る");
+    }
 }
 
 /// Windows 実機検証 (プラン Phase 3 / F3 のチェックリスト)。
@@ -861,7 +916,7 @@ mod win_real_env_tests {
     ) {
         let md = fs::symlink_metadata(&case.path).unwrap();
         let old_alloc = get_compressed_size(&case.path);
-        let old_key = file_info_by_handle(&case.path);
+        let old_key = hardlink_info_by_handle(&case.path);
         let new = file_size_info(&md, &case.path, true, true);
         let direct_ok = file_size_info_by_handle(&md, &case.path, true, true).is_some();
         (
@@ -928,8 +983,8 @@ mod win_real_env_tests {
 
         // ハードリンクの 2 パスが同一キーを持つこと (重複排除の前提)
         if let Some((base, twin)) = &hardlinks {
-            let k1 = file_info_by_handle(base);
-            let k2 = file_info_by_handle(twin);
+            let k1 = hardlink_info_by_handle(base);
+            let k2 = hardlink_info_by_handle(twin);
             assert_eq!(k1, k2, "ハードリンク2件のキーが一致しません");
             assert!(k1.is_some(), "ハードリンクキーが取得できません");
             println!("ハードリンク重複排除用キー: 一致 (キー={k1:?})");

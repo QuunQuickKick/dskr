@@ -64,6 +64,17 @@ pub(crate) fn write_report(
             )
         )?;
     }
+    if meta.errors > 0 {
+        writeln!(
+            w,
+            "{}",
+            ansi(
+                "注意: アクセスできない項目があります。合計は不完全です",
+                "33",
+                color
+            )
+        )?;
+    }
 
     let dirs = collect_top(
         outcome,

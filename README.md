@@ -28,6 +28,8 @@ dskr レポート
 - **正確**: ディスク上の使用量と見かけのサイズの両方を集計
   - Unix: `st_blocks × 512` (スパースファイル対応)
   - Windows: `GetCompressedFileSizeW` (NTFS 圧縮対応)
+  - 割当サイズを取得できない場合は見かけのサイズで代替し、エラー一覧に記録
+  - ハードリンクは実体を1回だけ計上 (Windows のネットワークプロファイルを除く)
 - **安全**: 既定は読み取り専用。`--allow-delete` を指定したときだけ、TUI で確認付きの削除ができます
 - **隠し項目は既定で非表示**: ドットファイル (`.git`、`.env` など) や Windows のシステムファイルは、`--hidden` を指定したときだけ表示・集計します
 - **外部送信なし**: ネットワーク通信コードを持たず、テレメトリも送信しません (UNC/ネットワークドライブを指定した場合のみ、OS の SMB アクセスが発生します)
@@ -177,7 +179,9 @@ dskr /data --allow-delete
 - 削除は**ゴミ箱ではなく完全削除**です。取り消せません
 - フォルダは中身ごと削除されます
 - シンボリックリンク / ジャンクションはリンク先を辿らず、リンク自体だけを削除します
+- `--follow-links` で中身を辿ったリンクは、削除すると集計がずれるため削除できません。リンク先を直接開いて削除してください
 - 削除に成功すると、画面の一覧と合計を即時更新します
+- ハードリンクの一方を削除しても、割当サイズは残存リンクへ引き継ぎます
 - `--no-tui` / `--format` / `--json` などの画面なし出力とは併用できません
 
 > **注意**: 削除は元に戻せません。重要なデータは事前にバックアップしてください。
@@ -285,7 +289,7 @@ dskr \\fileserver\share --load low --max-entries-per-sec 500
 ```
 
 - `--profile auto` (既定) では UNC / ネットワークドライブを検出し、ネットワーク向けの設定で動作します
-- ネットワーク越しはサーバの対応状況が異なるため、既定で「見かけのサイズ」を表示します (`a` キーで切替)
+- ネットワーク越しはサーバの対応状況が異なるため、既定で「見かけのサイズ」を表示します (`a` キーで切替)。Windows のネットワークプロファイルでは割当サイズを取得しないため、`--metric allocated` を指定しない限り `a` で切り替えられません
 - ジャンクション・シンボリックリンクは既定で辿りません (`--follow-links` 指定時も、同じボリューム内のみ)
 - 認証は OS の既存セッションのみ使用します。パスワードの入力・保存は行いません
 - OneDrive 等のクラウド プレースホルダはダウンロードされません。`--skip-cloud-placeholders` で集計から除外できます
@@ -300,6 +304,7 @@ dskr \\fileserver\share --load low --max-entries-per-sec 500
 - 外部通信が起こり得るのは、UNC パス/ネットワークドライブを指定した場合の OS の SMB アクセスのみです
 - `--local-only` を指定すると、ネットワーク上の場所 (NFS, SMB, sshfs 等) を走査せず、リンクも辿りません
 - `--follow-links` 指定時も `-x` / `--local-only` ではリンクを辿りません。Windows では同じボリューム内のリンク先のみ辿ります
+- ルートのボリュームIDを取得できない場合、`-x` / `--local-only` の境界判定は安全側で走査を制限し、エラー一覧に記録します
 - 既定は読み取り専用です。`--allow-delete` を指定しない限り、削除・移動・属性変更は行わず、ファイルの中身も開きません
 - `--allow-delete` 指定時の削除は確認ダイアログを経た完全削除です。フォルダは中身ごと削除され、リンクはリンク先を辿りません
 - ファイル名やエラーメッセージの制御文字は表示前に無害化します (端末制御やクリップボード操作を防ぐため)
@@ -326,6 +331,12 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
   "root": "\\\\fileserver\\share",
   "root_kind": "unc",
   "profile": "network",
+  "metric": "logical",
+  "allocated_collected": false,
+  "cancelled": false,
+  "truncated": false,
+  "incomplete": true,
+  "errors_truncated": false,
   "stats": { "entries": 4, "dirs": 3, "errors": 1, "elapsed_ms": 51, "threads": 12 },
   "options": { "load": "normal", "...": "..." },
   "errors": [ { "path": "...", "message": "..." } ],
@@ -335,7 +346,9 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 
 `tree` の `type` は `dir` / `file` / `other` (リンク・特殊ファイル) / `blocked` (`-x` や `--local-only` で走査しないフォルダ。中身は集計されない) のいずれかです。
 
-CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated`
+`incomplete` は、権限不足や列挙中エラーなどで取得できなかった項目があることを示します。`errors_truncated` は、エラー一覧が上限 (1000件) を超えて省略されていることを示します。`allocated_collected` が false のとき、`allocated` は実際の割当サイズではありません (Windows のネットワークプロファイルなど)。`mtime` は取得できない場合 `null` になります。
+
+CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected`
 
 ## パフォーマンス
 
@@ -366,7 +379,7 @@ strace -f -e trace=%network ./target/release/dskr /path --no-tui
 objdump -T target/release/dskr | grep -E '(^|[[:space:]])(connect|getaddrinfo|sendto|bind|listen|accept|socket)$'
 ```
 
-CI (GitHub Actions) は Linux / macOS / Windows のマトリクスでテストし、Windows ランナー上で `\\localhost\C$` を使った UNC スモークテストを実行します。
+CI (GitHub Actions) は Linux / macOS / Windows のマトリクスでテストし、MSRV 1.85 のジョブも実行します。Windows ランナーでは `\\localhost\C$` を使った UNC スモークテストを任意ジョブとして実行し、存在しない共有のエラーハンドリングは必須ジョブとして検証します。
 
 構成:
 

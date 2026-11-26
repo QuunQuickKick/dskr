@@ -15,6 +15,9 @@ pub struct ReportMeta {
     pub root_kind: &'static str,
     pub profile: String,
     pub metric: &'static str,
+    /// allocated (ディスク使用量) を実際に取得したか。
+    /// Windows のネットワークプロファイルでは false になり得る。
+    pub allocated_collected: bool,
     pub options: String, // JSON オブジェクト文字列
     pub cancelled: bool,
     pub truncated: bool,
@@ -61,6 +64,7 @@ pub fn build_meta(
     threads: usize,
     options_json: &str,
     metric: &'static str,
+    allocated_collected: bool,
 ) -> ReportMeta {
     ReportMeta {
         version: env!("CARGO_PKG_VERSION"),
@@ -69,6 +73,7 @@ pub fn build_meta(
         root_kind,
         profile: profile.to_string(),
         metric,
+        allocated_collected,
         options: options_json.to_string(),
         cancelled: outcome.cancelled,
         truncated: outcome.truncated,
@@ -81,17 +86,21 @@ pub fn build_meta(
 }
 
 pub fn write_json(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) -> io::Result<()> {
+    let errors_truncated = meta.errors > outcome.errors.len() as u64;
     write!(
         w,
-        "{{\"dskr_version\":{},\"generated_at\":{},\"root\":{},\"root_kind\":{},\"profile\":{},\"metric\":{},\"cancelled\":{},\"truncated\":{},\"stats\":{{\"entries\":{},\"dirs\":{},\"errors\":{},\"elapsed_ms\":{},\"threads\":{}}},\"options\":{},\"errors\":[",
+        "{{\"dskr_version\":{},\"generated_at\":{},\"root\":{},\"root_kind\":{},\"profile\":{},\"metric\":{},\"allocated_collected\":{},\"cancelled\":{},\"truncated\":{},\"incomplete\":{},\"errors_truncated\":{},\"stats\":{{\"entries\":{},\"dirs\":{},\"errors\":{},\"elapsed_ms\":{},\"threads\":{}}},\"options\":{},\"errors\":[",
         jstr(meta.version),
         jstr(&meta.generated_at),
         jstr(&meta.root),
         jstr(meta.root_kind),
         jstr(&meta.profile),
         jstr(meta.metric),
+        meta.allocated_collected,
         meta.cancelled,
         meta.truncated,
+        meta.errors > 0,
+        errors_truncated,
         meta.entries,
         meta.dirs,
         meta.errors,
@@ -124,6 +133,13 @@ fn node_json(w: &mut dyn Write, t: &Tree, i: u32) -> io::Result<()> {
         NodeKind::Other => "other",
         NodeKind::Blocked => "blocked",
     };
+    // mtime 0 は取得できなかったことを表す (UI も "-" 表示)。
+    // JSON では 1970年と誤認しないよう null にする。
+    let mtime = if n.mtime == 0 {
+        "null".to_string()
+    } else {
+        n.mtime.to_string()
+    };
     write!(
         w,
         "{{\"name\":{},\"type\":{},\"allocated\":{},\"logical\":{},\"files\":{},\"dirs\":{},\"errors\":{},\"mtime\":{},\"truncated\":{}",
@@ -134,7 +150,7 @@ fn node_json(w: &mut dyn Write, t: &Tree, i: u32) -> io::Result<()> {
         n.file_count,
         n.dir_count,
         n.err_count,
-        n.mtime,
+        mtime,
         n.truncated,
     )?;
     if n.kind == NodeKind::Dir && !n.children.is_empty() {
@@ -201,22 +217,41 @@ pub fn create_private(path: &std::path::Path, exclusive: bool) -> io::Result<std
     opts.open(path)
 }
 
-pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome) -> io::Result<()> {
+pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) -> io::Result<()> {
     writeln!(
         w,
-        "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated"
+        "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected"
     )?;
-    write_csv_node(w, &outcome.tree, outcome.tree.root, &mut Vec::new())
+    write_csv_node(
+        w,
+        &outcome.tree,
+        outcome.tree.root,
+        &mut Vec::new(),
+        meta.cancelled,
+        meta.truncated,
+        meta.errors,
+        meta.allocated_collected,
+    )
 }
 
-fn write_csv_node(w: &mut dyn Write, t: &Tree, i: u32, parts: &mut Vec<String>) -> io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn write_csv_node(
+    w: &mut dyn Write,
+    t: &Tree,
+    i: u32,
+    parts: &mut Vec<String>,
+    cancelled: bool,
+    scan_truncated: bool,
+    scan_errors: u64,
+    allocated_collected: bool,
+) -> io::Result<()> {
     let n = &t.nodes[i as usize];
     let name = n.name.to_string_lossy().into_owned();
     parts.push(name);
     let p = parts.join("/");
     writeln!(
         w,
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_field(&p),
         n.kind == NodeKind::Dir,
         n.total_alloc,
@@ -225,10 +260,23 @@ fn write_csv_node(w: &mut dyn Write, t: &Tree, i: u32, parts: &mut Vec<String>) 
         n.dir_count,
         n.err_count,
         n.truncated,
+        cancelled,
+        scan_truncated,
+        scan_errors,
+        allocated_collected,
     )?;
     let depth = parts.len();
     for &c in &n.children {
-        write_csv_node(w, t, c, parts)?;
+        write_csv_node(
+            w,
+            t,
+            c,
+            parts,
+            cancelled,
+            scan_truncated,
+            scan_errors,
+            allocated_collected,
+        )?;
         parts.truncate(depth);
     }
     parts.pop();

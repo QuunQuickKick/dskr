@@ -1144,6 +1144,7 @@ mod tests {
         let outcome = ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 4,
@@ -1186,6 +1187,7 @@ mod tests {
         let outcome = ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 2,
@@ -1223,6 +1225,7 @@ mod tests {
         let outcome = ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 2,

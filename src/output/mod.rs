@@ -131,7 +131,7 @@ pub fn write_output(
         OutputFormat::Markdown => markdown::write_markdown(w, outcome, meta, opts),
         OutputFormat::Html => html::write_html(w, outcome, meta, opts),
         OutputFormat::Json => crate::report::write_json(w, outcome, meta),
-        OutputFormat::Csv => crate::report::write_csv(w, outcome),
+        OutputFormat::Csv => crate::report::write_csv(w, outcome, meta),
     }
 }
 
@@ -543,6 +543,7 @@ mod tests {
         let outcome = ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 8,
@@ -560,6 +561,7 @@ mod tests {
             root_kind: "local",
             profile: "local".into(),
             metric: "allocated",
+            allocated_collected: true,
             options: "{}".into(),
             cancelled: false,
             truncated: false,
@@ -725,6 +727,7 @@ mod tests {
         let outcome = ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 2,
@@ -747,6 +750,89 @@ mod tests {
         output_for_test(&mut buf, &outcome, &meta, &opts(OutputFormat::Tree)).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("l (link)"), "{s}");
+    }
+
+    #[test]
+    fn incomplete_scan_is_announced_in_all_formats() {
+        let (mut outcome, mut meta) = fixture();
+        outcome.error_count = 1;
+        outcome.errors.push(crate::scan::engine::ScanError {
+            path: "/root/denied".into(),
+            message: "permission denied".into(),
+        });
+        meta.errors = 1;
+
+        for format in [
+            OutputFormat::Report,
+            OutputFormat::Markdown,
+            OutputFormat::Html,
+        ] {
+            let mut buf = Vec::new();
+            output_for_test(&mut buf, &outcome, &meta, &opts(format)).unwrap();
+            let s = String::from_utf8(buf).unwrap();
+            assert!(s.contains("不完全"), "{format:?}: {s}");
+        }
+
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.contains("\"incomplete\":true"), "{s}");
+    }
+
+    #[test]
+    fn truncated_error_list_is_announced() {
+        let (mut outcome, mut meta) = fixture();
+        for i in 0..2 {
+            outcome.errors.push(crate::scan::engine::ScanError {
+                path: format!("/root/denied{i}"),
+                message: "permission denied".into(),
+            });
+        }
+        outcome.error_count = 1005;
+        meta.errors = 1005;
+
+        for format in [OutputFormat::Markdown, OutputFormat::Html] {
+            let mut buf = Vec::new();
+            output_for_test(&mut buf, &outcome, &meta, &opts(format)).unwrap();
+            let s = String::from_utf8(buf).unwrap();
+            assert!(s.contains("先頭 2 件"), "{format:?}: {s}");
+        }
+
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.contains("\"errors_truncated\":true"), "{s}");
+    }
+
+    #[test]
+    fn csv_includes_scan_summary() {
+        let (outcome, mut meta) = fixture();
+        meta.cancelled = true;
+        meta.truncated = true;
+        meta.errors = 2;
+
+        let mut buf = Vec::new();
+        output_for_test(&mut buf, &outcome, &meta, &opts(OutputFormat::Csv)).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let mut lines = s.lines();
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .ends_with("truncated,cancelled,scan_truncated,scan_errors,allocated_collected"),
+            "{s}"
+        );
+        let root = lines.next().unwrap();
+        assert!(root.ends_with(",false,true,true,2,true"), "{root}");
+    }
+
+    #[test]
+    fn json_uses_null_for_unknown_mtime() {
+        let (outcome, meta) = fixture();
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.contains("\"mtime\":null"), "{s}");
     }
 
     fn output_for_test(

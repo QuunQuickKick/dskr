@@ -97,6 +97,12 @@ pub(crate) fn write_html(
             "<p class=\"warn\">注意: 深さ/件数の上限により一部が省略されています</p>"
         )?;
     }
+    if meta.errors > 0 {
+        writeln!(
+            w,
+            "<p class=\"warn\">注意: アクセスできない項目があります。合計は不完全です</p>"
+        )?;
+    }
 
     writeln!(w, "<div class=\"cards\">")?;
     card(w, "合計", &human_bytes(opts, total))?;
@@ -180,6 +186,14 @@ pub(crate) fn write_html(
 
     if !outcome.errors.is_empty() {
         writeln!(w, "<h2>エラー</h2>")?;
+        if (outcome.errors.len() as u64) < meta.errors {
+            writeln!(
+                w,
+                "<p class=\"warn\">全 {} 件のうち先頭 {} 件を表示しています</p>",
+                meta.errors,
+                outcome.errors.len()
+            )?;
+        }
         writeln!(
             w,
             "<table><thead><tr><th>パス</th><th>内容</th></tr></thead><tbody>"

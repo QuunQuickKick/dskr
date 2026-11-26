@@ -203,6 +203,26 @@ impl Tree {
         true
     }
 
+    /// ハードリンクの計上先を残存ノードへ移す。`idx` 自身と祖先の
+    /// `total_alloc` を加算する。ルートや範囲外は変更せず false を返す。
+    pub fn add_alloc(&mut self, idx: u32, amount: u64) -> bool {
+        if amount == 0 || idx == self.root || idx as usize >= self.nodes.len() {
+            return false;
+        }
+        self.nodes[idx as usize].own_alloc =
+            self.nodes[idx as usize].own_alloc.saturating_add(amount);
+        let mut cur = idx;
+        loop {
+            let n = &mut self.nodes[cur as usize];
+            n.total_alloc = n.total_alloc.saturating_add(amount);
+            if cur == self.root || n.parent == u32::MAX {
+                break;
+            }
+            cur = n.parent;
+        }
+        true
+    }
+
     /// 逆順に走査して子の合計を親へ加算する。
     /// 子は必ず親より後のインデックスで作られるため、後ろから 1 回で足りる。
     pub fn aggregate(&mut self) {
@@ -296,6 +316,28 @@ mod tests {
         assert!(!t.detach(0));
         assert!(!t.detach(99));
         assert_eq!(t.node(0).children.len(), 0);
+    }
+
+    #[test]
+    fn add_alloc_updates_own_and_ancestors() {
+        let mut t = Tree::with_root("root".into(), 0);
+        let d = t
+            .push_child_capped(0, Node::dir("sub".into(), 0, 1, 0), 100)
+            .unwrap();
+        let f = t
+            .push_child_capped(d, Node::file("a".into(), d, 2, 0, 10, 0), 100)
+            .unwrap();
+        t.aggregate();
+        assert_eq!(t.node(0).total_alloc, 0);
+
+        assert!(t.add_alloc(f, 100));
+        assert_eq!(t.node(f).own_alloc, 100);
+        assert_eq!(t.node(f).total_alloc, 100);
+        assert_eq!(t.node(d).total_alloc, 100);
+        assert_eq!(t.node(0).total_alloc, 100);
+
+        assert!(!t.add_alloc(0, 50), "ルートは対象外");
+        assert!(!t.add_alloc(99, 50), "範囲外は対象外");
     }
 
     #[test]

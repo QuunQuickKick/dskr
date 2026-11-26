@@ -40,6 +40,12 @@ pub(crate) fn write_markdown(
     if meta.truncated {
         writeln!(w, "- **注意: 深さ/件数の上限により一部が省略されています**")?;
     }
+    if meta.errors > 0 {
+        writeln!(
+            w,
+            "- **注意: アクセスできない項目があります。合計は不完全です**"
+        )?;
+    }
     writeln!(w)?;
 
     writeln!(w, "## サマリー")?;
@@ -118,6 +124,15 @@ pub(crate) fn write_markdown(
     if !outcome.errors.is_empty() {
         writeln!(w, "## エラー")?;
         writeln!(w)?;
+        if (outcome.errors.len() as u64) < meta.errors {
+            writeln!(
+                w,
+                "全 {} 件のうち先頭 {} 件を表示しています。",
+                meta.errors,
+                outcome.errors.len()
+            )?;
+            writeln!(w)?;
+        }
         writeln!(w, "| パス | 内容 |")?;
         writeln!(w, "|---|---|")?;
         for e in &outcome.errors {

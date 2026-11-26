@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -72,6 +73,9 @@ pub struct App {
     pub root_kind: RootKind,
     pub profile_label: String,
     pub show_allocated: bool,
+    /// allocated (ディスク使用量) を実際に取得済みか。
+    /// Windows のネットワークプロファイルでは取得しないことがある。
+    pub alloc_collected: bool,
     pub allow_delete: bool,
     pub delete_target: Option<DeleteTarget>,
     pub outcome: Option<ScanOutcome>,
@@ -105,6 +109,17 @@ pub struct App {
     pub engine_options: String,
 }
 
+/// 削除対象のサブツリーに含まれるノード番号を集める。
+fn subtree_indices(tree: &Tree, root: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(idx) = stack.pop() {
+        out.push(idx);
+        stack.extend(tree.node(idx).children.iter().copied());
+    }
+    out
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -119,12 +134,16 @@ impl App {
         engine_options: String,
     ) -> Self {
         let root_display = root.to_string_lossy().into_owned();
+        // Windows ネットワークでは、明示的に --metric allocated を選んだ場合を
+        // 除いて割当サイズを取得しない (サーバへの余計な往復を避ける)。
+        let alloc_collected = show_allocated || !cfg!(windows) || profile_label != "network";
         App {
             root,
             root_display,
             root_kind,
             profile_label,
             show_allocated,
+            alloc_collected,
             allow_delete,
             delete_target: None,
             outcome: None,
@@ -343,6 +362,15 @@ impl App {
                 kind = NodeKind::Other;
             }
         }
+        // リンク先の中身をツリーに持つリンクを消すと、リンク先が別のパスに
+        // 残っている場合に合計がずれる。安全のため削除を拒否する。
+        if kind == NodeKind::Other && !n.children.is_empty() {
+            self.message = Some(
+                "--follow-links で辿ったリンクは削除できません (リンク先を直接開いてください)"
+                    .into(),
+            );
+            return;
+        }
         self.delete_target = Some(DeleteTarget {
             node: idx,
             path,
@@ -406,8 +434,35 @@ impl App {
         };
         match delete::remove_target(&target.path, target.kind) {
             Ok(()) => {
-                if let Some(t) = self.tree_mut() {
-                    t.detach(target.node);
+                if let Some(out) = self.outcome.as_mut() {
+                    // 再帰削除するのは記録上 Dir のときだけ。リンクや Blocked は
+                    // 実体だけを消すため、子ノードを削除済みとして扱わない。
+                    let removed: HashSet<u32> = if target.kind == NodeKind::Dir {
+                        subtree_indices(&out.tree, target.node)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        std::iter::once(target.node).collect()
+                    };
+                    if out.tree.detach(target.node) {
+                        // 削除した側がハードリンクの実体を計上していた場合、
+                        // 残存リンクへ割当サイズを移す。
+                        let mut groups = std::mem::take(&mut out.hardlink_groups);
+                        for nodes in groups.values_mut() {
+                            let owner = nodes
+                                .iter()
+                                .copied()
+                                .find(|&n| removed.contains(&n) && out.tree.node(n).own_alloc > 0);
+                            let survivor = nodes.iter().copied().find(|&n| !removed.contains(&n));
+                            if let (Some(owner), Some(survivor)) = (owner, survivor) {
+                                let amount = out.tree.node(owner).own_alloc;
+                                out.tree.add_alloc(survivor, amount);
+                            }
+                            nodes.retain(|n| !removed.contains(n));
+                        }
+                        groups.retain(|_, nodes| nodes.len() > 1);
+                        out.hardlink_groups = groups;
+                    }
                 }
                 self.rebuild();
                 self.mode = Mode::Normal;
@@ -639,6 +694,7 @@ impl App {
             self.threads,
             &self.engine_options,
             self.metric_label(),
+            self.alloc_collected,
         );
         let opts = OutputOptions {
             format: req.format,
@@ -797,6 +853,13 @@ impl App {
                 ));
             }
             Char('a') => {
+                if !self.show_allocated && !self.alloc_collected {
+                    self.message = Some(
+                        "このプロファイルではディスク使用量を取得していません (見かけのサイズのみ)"
+                            .into(),
+                    );
+                    return;
+                }
                 self.show_allocated = !self.show_allocated;
                 self.rebuild();
                 self.message = Some(format!("合計: {}", self.metric_display_label()));
@@ -884,6 +947,7 @@ mod tests {
         app.finish(ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 3,
@@ -936,6 +1000,7 @@ mod tests {
         app.finish(ScanOutcome {
             tree,
             errors: Vec::new(),
+            hardlink_groups: Default::default(),
             truncated: false,
             cancelled: false,
             entries: 0,
@@ -995,6 +1060,214 @@ mod tests {
             app.path_of(file_idx),
             dir.path().join("victim").join("a.bin")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_followed_symlink_with_children_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside"), b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut tree = Tree::with_root(dir.path().as_os_str().to_owned(), 0);
+        let link_idx = tree
+            .push_child_capped(0, Node::dir("link".into(), 0, 1, 0), 100)
+            .unwrap();
+        tree.push_child_capped(
+            link_idx,
+            Node::file("inside".into(), link_idx, 2, 10, 1, 0),
+            100,
+        )
+        .unwrap();
+        tree.aggregate();
+
+        let mut app = test_app_at(dir.path(), true);
+        app.finish(ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: 2,
+            dirs: 1,
+            error_count: 0,
+            bytes_alloc: 10,
+            bytes_logical: 1,
+            elapsed: Duration::from_millis(1),
+            root: dir.path().to_path_buf(),
+        });
+
+        app.sel = app
+            .listing
+            .iter()
+            .position(|&i| app.tree().unwrap().node(i).name.to_string_lossy() == "link")
+            .unwrap();
+        app.begin_delete();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.delete_target.is_none());
+        assert!(link.exists());
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("--follow-links"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_hardlink_owner_moves_allocation_to_survivor() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("f1");
+        let f2 = dir.path().join("f2");
+        std::fs::write(&f1, b"x").unwrap();
+        std::fs::hard_link(&f1, &f2).unwrap();
+
+        let mut tree = Tree::with_root(dir.path().as_os_str().to_owned(), 0);
+        let n1 = tree
+            .push_child_capped(0, Node::file("f1".into(), 0, 1, 100, 1, 0), 100)
+            .unwrap();
+        let n2 = tree
+            .push_child_capped(0, Node::file("f2".into(), 0, 1, 0, 1, 0), 100)
+            .unwrap();
+        tree.aggregate();
+
+        let mut groups = HashMap::new();
+        groups.insert((1u64, 1u64), vec![n1, n2]);
+        let mut app = test_app_at(dir.path(), true);
+        app.finish(ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: groups,
+            truncated: false,
+            cancelled: false,
+            entries: 2,
+            dirs: 0,
+            error_count: 0,
+            bytes_alloc: 100,
+            bytes_logical: 2,
+            elapsed: Duration::from_millis(1),
+            root: dir.path().to_path_buf(),
+        });
+
+        app.sel = app
+            .listing
+            .iter()
+            .position(|&i| app.tree().unwrap().node(i).name.to_string_lossy() == "f1")
+            .unwrap();
+        app.begin_delete();
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+        app.perform_delete();
+
+        assert!(!f1.exists());
+        assert!(f2.exists());
+        let tree = app.tree().unwrap();
+        assert_eq!(tree.node(n2).own_alloc, 100);
+        assert_eq!(tree.node(tree.root).total_alloc, 100);
+        assert!(app.outcome.as_ref().unwrap().hardlink_groups.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_directory_with_hardlink_owner_moves_allocation_outside() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let inside = sub.join("inside");
+        let outside = dir.path().join("outside");
+        std::fs::write(&inside, b"x").unwrap();
+        std::fs::hard_link(&inside, &outside).unwrap();
+
+        let mut tree = Tree::with_root(dir.path().as_os_str().to_owned(), 0);
+        let sub_idx = tree
+            .push_child_capped(0, Node::dir("sub".into(), 0, 1, 0), 100)
+            .unwrap();
+        let inside_idx = tree
+            .push_child_capped(
+                sub_idx,
+                Node::file("inside".into(), sub_idx, 2, 100, 1, 0),
+                100,
+            )
+            .unwrap();
+        let outside_idx = tree
+            .push_child_capped(0, Node::file("outside".into(), 0, 1, 0, 1, 0), 100)
+            .unwrap();
+        tree.aggregate();
+
+        let mut groups = HashMap::new();
+        groups.insert((1u64, 1u64), vec![inside_idx, outside_idx]);
+        let mut app = test_app_at(dir.path(), true);
+        app.finish(ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: groups,
+            truncated: false,
+            cancelled: false,
+            entries: 3,
+            dirs: 1,
+            error_count: 0,
+            bytes_alloc: 100,
+            bytes_logical: 2,
+            elapsed: Duration::from_millis(1),
+            root: dir.path().to_path_buf(),
+        });
+
+        app.delete_target = Some(DeleteTarget {
+            node: sub_idx,
+            path: sub.clone(),
+            kind: NodeKind::Dir,
+            bytes: 100,
+            files: 1,
+            dirs: 0,
+            truncated: false,
+            input: "yes".into(),
+            error: None,
+        });
+        app.perform_delete();
+
+        assert!(!sub.exists());
+        assert!(outside.exists());
+        let tree = app.tree().unwrap();
+        assert_eq!(tree.node(outside_idx).own_alloc, 100);
+        assert_eq!(tree.node(tree.root).total_alloc, 100);
+        assert!(app.outcome.as_ref().unwrap().hardlink_groups.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_network_profile_without_alloc_cannot_toggle_metric() {
+        let mut app = App::new(
+            PathBuf::from(r"C:\"),
+            RootKind::Unc,
+            "network".to_string(),
+            false,
+            false,
+            Arc::new(Progress::new()),
+            Arc::new(Control::new()),
+            2,
+            "{}".to_string(),
+        );
+        assert!(!app.alloc_collected);
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!app.show_allocated);
+        assert!(app.message.as_deref().unwrap_or("").contains("見かけ"));
+    }
+
+    #[test]
+    fn ctrl_c_requests_force_quit() {
+        let mut app = test_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.force_quit);
     }
 
     #[test]

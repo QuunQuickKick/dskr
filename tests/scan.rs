@@ -77,6 +77,12 @@ fn hardlink_dedup() {
     assert_eq!(root.file_count, 2);
     assert_eq!(root.total_logical, 20);
     assert_eq!(root.total_alloc, blocks * 512); // 同一実体は1回のみ
+    assert_eq!(out.hardlink_groups.len(), 1);
+    assert_eq!(
+        out.hardlink_groups.values().next().unwrap().len(),
+        2,
+        "削除時の移し替え用に両方のノードを保持する"
+    );
 }
 
 #[test]
@@ -200,6 +206,74 @@ fn max_depth_limits() {
     assert_eq!(root.file_count, 1); // a/shallow.txt のみ (b/deep.txt は深さ3)
     let a_idx = child(&out, "a").unwrap();
     assert_eq!(out.tree.node(a_idx).file_count, 1);
+}
+
+#[test]
+fn unicode_names_are_counted() {
+    let dir = tempdir().unwrap();
+    let name = "日本語 🚀 report.txt";
+    fs::write(dir.path().join(name), vec![0u8; 123]).unwrap();
+
+    let out = scan(dir.path(), cfg(dir.path()));
+    let root = out.tree.node(out.tree.root);
+    assert_eq!(root.file_count, 1);
+    assert_eq!(root.total_logical, 123);
+    let idx = child(&out, name).expect("Unicode 名のノードがありません");
+    assert_eq!(out.tree.node(idx).kind, dskr::scan::NodeKind::File);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_junction_is_not_followed_by_default() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("inside.txt"), vec![0u8; 10]).unwrap();
+    let link = dir.path().join("junction");
+
+    // ジャンクション作成に失敗する環境 (権限・ポリシー) ではスキップする。
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &link.to_string_lossy(),
+            &target.to_string_lossy(),
+        ])
+        .status();
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        println!("(スキップ: ジャンクションを作成できません)");
+        return;
+    }
+
+    let out = scan(dir.path(), cfg(dir.path()));
+    let root = out.tree.node(out.tree.root);
+    assert_eq!(root.file_count, 1, "リンク先を二重計上しています");
+    let link_idx = child(&out, "junction").expect("junction ノードがありません");
+    assert_eq!(
+        out.tree.node(link_idx).kind,
+        dskr::scan::NodeKind::Other,
+        "ジャンクションは既定で辿らない"
+    );
+    assert!(out.tree.node(link_idx).children.is_empty());
+}
+
+#[test]
+fn max_nodes_marks_global_truncated() {
+    let dir = tempdir().unwrap();
+    for i in 0..30 {
+        fs::write(dir.path().join(format!("f{i}")), vec![0u8; 10]).unwrap();
+    }
+
+    let mut c = cfg(dir.path());
+    c.max_nodes = 5;
+    let out = scan(dir.path(), c);
+
+    assert!(out.truncated, "max_nodes 超過が全体に反映されていません");
+    assert!(
+        out.tree.node(out.tree.root).truncated,
+        "ルートに truncated が立っていません"
+    );
 }
 
 #[test]
@@ -399,6 +473,7 @@ fn json_and_csv_reports() {
         root_kind: "local",
         profile: "local".into(),
         metric: "allocated",
+        allocated_collected: true,
         options: "{}".into(),
         cancelled: false,
         truncated: false,
@@ -420,13 +495,18 @@ fn json_and_csv_reports() {
     #[cfg(not(unix))]
     assert!(s.contains("\"allocated\":12345"));
     assert!(s.contains("\"name\":\"a.bin\""));
+    assert!(s.contains("\"incomplete\":false"));
+    assert!(s.contains("\"errors_truncated\":false"));
+    assert!(s.contains("\"allocated_collected\":true"));
     assert!(s.ends_with("}\n"));
 
     let mut csv: Vec<u8> = Vec::new();
-    dskr::report::write_csv(&mut csv, &out).unwrap();
+    dskr::report::write_csv(&mut csv, &out, &meta).unwrap();
     let s = String::from_utf8(csv).unwrap();
     assert!(
-        s.starts_with("path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated\n")
+        s.starts_with(
+            "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected\n"
+        )
     );
     assert!(s.contains("a.bin,false,"));
 }
