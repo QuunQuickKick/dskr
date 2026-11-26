@@ -360,6 +360,44 @@ CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,c
 
 ネイティブ SSD 環境では並列 `stat` によりさらに高速に動作します。ボトルネックはディスクのメタデータ I/O であり、CPU ではありません。
 
+### ベンチマーク
+
+再現可能なフィクスチャで wall time / 最大 RSS / CPU / I/O を測るスクリプトを同梱しています。
+
+```sh
+cargo build --release
+scripts/bench.sh
+```
+
+既定では 10,000 / 100,000 ファイルを生成し、各ケースを3回測ります。`du -s` も比較対象として実行します。
+
+```sh
+# 大規模データを測る (ディスク容量に注意)
+BENCH_SIZES="1000000" BENCH_FILES_PER_DIR=1000 scripts/bench.sh
+
+# フィクスチャを消す / コールドキャッシュで測る
+BENCH_KEEP=0 scripts/bench.sh
+sudo env BENCH_DROP_CACHES=1 scripts/bench.sh
+```
+
+主な環境変数:
+
+| 変数 | 既定値 | 意味 |
+|---|---|---|
+| `BENCH_SIZES` | `10000 100000` | ファイル数の一覧 |
+| `BENCH_FILES_PER_DIR` | `100` | 1フォルダあたりのファイル数 |
+| `BENCH_FILE_SIZE` | `1024` | 各ファイルのサイズ (バイト) |
+| `BENCH_REPEATS` | `3` | 計測回数 |
+| `BENCH_WARMUP` | `1` | ウォームアップ回数 |
+| `BENCH_BASE` | `$TMPDIR/dskr-bench` | フィクスチャ置き場 |
+| `BENCH_KEEP` | `1` | フィクスチャを残す |
+| `BENCH_DROP_CACHES` | `0` | Linux でページキャッシュを落とす (root) |
+| `BENCH_DU` | `1` | `du -s` も計測する |
+
+出力は TSV です。Linux では `/proc` から RSS と I/O を取得し、macOS では `ps` から RSS/CPU を取得します (I/O は未対応)。Windows は WSL など bash が動く環境で実行してください。
+
+結果は環境依存です。比較するときは、同じハードウェア・同じファイル構成・同じキャッシュ状態で測ってください。
+
 ## 開発
 
 ```sh
