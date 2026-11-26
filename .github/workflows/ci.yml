@@ -31,11 +31,18 @@ jobs:
 
       - name: No network syscall imports
         run: |
-          cargo build --release
+          cargo build --release --locked
           if objdump -T target/release/dskr | grep -E '(^|[[:space:]])(connect|getaddrinfo|getnameinfo|sendto|recvfrom|bind|listen|accept|socket)$'; then
             echo "network syscall import found" >&2
             exit 1
           fi
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --locked --all-targets
 
   test:
     strategy:
@@ -47,19 +54,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - run: cargo test
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+
+  windows-unc-error-handling:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: UNC error handling (nonexistent share)
+        run: cargo run --release --locked -- "\\localhost\nosuchshare" --no-tui --top 5 ; if ($LASTEXITCODE -eq 0) { exit 1 } else { exit 0 }
 
   windows-unc-smoke:
     runs-on: windows-latest
+    # GitHub ホストランナーの管理者共有は環境依存のため、必須テストとは分離する。
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: UNC smoke test (local admin share)
-        run: cargo run --release -- "\\localhost\C$\Users" --no-tui --top 5
-      - name: UNC error handling (nonexistent share)
-        run: cargo run --release -- "\\localhost\nosuchshare" --no-tui --top 5 ; if ($LASTEXITCODE -eq 0) { exit 1 } else { exit 0 }
+        run: cargo run --release --locked -- "\\localhost\C$\Users" --no-tui --top 5
 
   windows-build-script:
     runs-on: windows-latest
