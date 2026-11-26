@@ -21,6 +21,7 @@ WARMUP=${BENCH_WARMUP:-1}
 KEEP=${BENCH_KEEP:-1}
 DROP_CACHES=${BENCH_DROP_CACHES:-0}
 WITH_DU=${BENCH_DU:-1}
+CANCEL_AFTER_MS=${BENCH_CANCEL_AFTER_MS:-0}
 
 TMP_OUT=$(mktemp -d "${TMPDIR:-/tmp}/dskr-bench-out.XXXXXX")
 trap 'rm -rf "$TMP_OUT"' EXIT
@@ -39,6 +40,10 @@ for value in "$FILES_PER_DIR" "$REPEATS"; do
 done
 if ! [[ "$WARMUP" =~ ^[0-9]+$ ]]; then
     echo "BENCH_WARMUP が不正です: $WARMUP" >&2
+    exit 1
+fi
+if ! [[ "$CANCEL_AFTER_MS" =~ ^[0-9]+$ ]]; then
+    echo "BENCH_CANCEL_AFTER_MS が不正です: $CANCEL_AFTER_MS" >&2
     exit 1
 fi
 if ! [[ "$FILE_SIZE" =~ ^[0-9]+$ ]]; then
@@ -103,7 +108,11 @@ fixture() {
     for ((d = 0; d < dirs; d++)); do
         mkdir -p "$root/d$d"
         for ((i = 0; i < FILES_PER_DIR && n < count; i++, n++)); do
-            head -c "$FILE_SIZE" /dev/zero >"$root/d$d/f$i"
+            if [ "$FILE_SIZE" -eq 0 ]; then
+                : >"$root/d$d/f$i"
+            else
+                head -c "$FILE_SIZE" /dev/zero >"$root/d$d/f$i"
+            fi
         done
     done
     printf '%s\n' "$want" >"$root/.fixture"
@@ -167,6 +176,35 @@ measure() {
         "$label" "$wall_ms" "$max_rss" "$cpu_s" "$read_bytes" "$write_bytes" "$status"
 }
 
+# SIGINT を送ってから終了するまでの時間を wall_ms として返す。
+measure_cancel() {
+    local label=$1
+    local delay_ms=$2
+    shift 2
+
+    local err="$TMP_OUT/err"
+    local start kill_at end pid rss=0 status=0
+    local delay_s
+    delay_s=$(awk -v ms="$delay_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
+    start=$(now_ns)
+    ( trap - INT; exec "$@" ) >/dev/null 2>"$err" &
+    pid=$!
+    sleep "$delay_s"
+    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+    [[ "$rss" =~ ^[0-9]+$ ]] || rss=0
+    kill_at=$(now_ns)
+    kill -INT "$pid" 2>/dev/null || true
+    if wait "$pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    end=$(now_ns)
+    local cancel_ms=$(( (end - kill_at) / 1000000 ))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$label" "$cancel_ms" "$rss" "0" "0" "0" "$status"
+}
+
 run_dskr() {
     local count=$1
     local root=$2
@@ -205,6 +243,11 @@ for i in "${!COUNTS[@]}"; do
         for ((r = 1; r <= REPEATS; r++)); do
             measure "du-$count-$r" du -s "$root"
         done
+    fi
+
+    if [ "$CANCEL_AFTER_MS" -gt 0 ]; then
+        measure_cancel "dskr-$count-cancel" "$CANCEL_AFTER_MS" \
+            "$BIN" "$root" --no-tui --format json
     fi
 done
 

@@ -222,6 +222,89 @@ fn unicode_names_are_counted() {
     assert_eq!(out.tree.node(idx).kind, dskr::scan::NodeKind::File);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sparse_file_reports_allocated_below_logical() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("sparse.bin");
+    let mut file = fs::File::create(&path).unwrap();
+    file.set_len(8 * 1024 * 1024).unwrap();
+    file.seek(SeekFrom::Start(7 * 1024 * 1024)).unwrap();
+    file.write_all(b"x").unwrap();
+    drop(file);
+
+    let md = fs::metadata(&path).unwrap();
+    if md.blocks().saturating_mul(512) >= md.len() {
+        println!("(スキップ: このファイルシステムはスパースを報告しません)");
+        return;
+    }
+
+    let out = scan(dir.path(), cfg(dir.path()));
+    let root = out.tree.node(out.tree.root);
+    assert_eq!(root.file_count, 1);
+    assert_eq!(root.total_logical, 8 * 1024 * 1024);
+    assert!(
+        root.total_alloc < root.total_logical,
+        "スパースの割当サイズが logical 以上です: {} >= {}",
+        root.total_alloc,
+        root.total_logical
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apfs_clone_is_counted() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("source.bin");
+    let dst = dir.path().join("clone.bin");
+    fs::write(&src, vec![0x5au8; 1024 * 1024]).unwrap();
+
+    // APFS の clone 作成。コピー先の FS が対応していなければスキップ。
+    let status = std::process::Command::new("cp")
+        .args(["-c"])
+        .arg(&src)
+        .arg(&dst)
+        .status();
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        println!("(スキップ: cp -c で clone を作成できません)");
+        return;
+    }
+
+    let out = scan(dir.path(), cfg(dir.path()));
+    let root = out.tree.node(out.tree.root);
+    assert_eq!(root.file_count, 2);
+    assert_eq!(root.total_logical, 2 * 1024 * 1024);
+    assert!(root.total_alloc > 0);
+    // clone の共有ブロック重複排除は未実装。ここでは集計が破綻しないことだけ確認する。
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_long_path_is_scanned() {
+    let base = tempdir().unwrap();
+    let mut long_root = base.path().to_path_buf();
+    for i in 0..16 {
+        long_root.push(format!("segment_{i:02}_abcdefghij"));
+    }
+    assert!(long_root.as_os_str().len() > 260);
+
+    let extended_root = dskr::path::to_extended(&long_root);
+    fs::create_dir_all(&extended_root).unwrap();
+    let file = long_root.join("file.txt");
+    fs::write(dskr::path::to_extended(&file), b"x").unwrap();
+
+    let out = scan(&long_root, cfg(&long_root));
+    let root = out.tree.node(out.tree.root);
+    assert_eq!(
+        root.file_count, 1,
+        "長いパス配下のファイルが集計されていません"
+    );
+    assert_eq!(root.total_logical, 1);
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_junction_is_not_followed_by_default() {
