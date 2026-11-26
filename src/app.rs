@@ -1258,6 +1258,7 @@ mod tests {
             "{}".to_string(),
         );
         assert!(!app.alloc_collected);
+        app.scanning = false;
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(!app.show_allocated);
         assert!(app.message.as_deref().unwrap_or("").contains("見かけ"));
