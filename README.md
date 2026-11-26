@@ -327,7 +327,7 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 
 ```json
 {
-  "dskr_version": "0.1.0",
+  "dskr_version": "0.2.0",
   "generated_at": "2026-11-25T00:30:04.357Z",
   "root": "\\\\fileserver\\share",
   "root_kind": "unc",
@@ -356,6 +356,7 @@ CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,c
 | 環境 | 結果 |
 |---|---|
 | WSL2 (ext4, 12 スレッド) | 30,538 ファイル / 1.6 秒 (同一環境の `du -s` は 6.2 秒) |
+| 1,000,000 空ファイル (warm cache, Linux) | dskr 約 0.48 秒 / 最大 RSS 約 151 MiB / キャンセル応答 約 5 ms (`du -s` は約 1.1 秒) |
 | 負荷プリセット `low` | スレッドを CPU/4（最大8）に削減。レート上限はネットワークのみ 2,000 項目/秒 |
 
 ネイティブ SSD 環境では並列 `stat` によりさらに高速に動作します。ボトルネックはディスクのメタデータ I/O であり、CPU ではありません。
@@ -375,6 +376,9 @@ scripts/bench.sh
 # 大規模データを測る (ディスク容量に注意)
 BENCH_SIZES="1000000" BENCH_FILES_PER_DIR=1000 scripts/bench.sh
 
+# 100ms 後に SIGINT を送り、中止までの応答時間も測る
+BENCH_SIZES="1000000" BENCH_CANCEL_AFTER_MS=100 scripts/bench.sh
+
 # フィクスチャを消す / コールドキャッシュで測る
 BENCH_KEEP=0 scripts/bench.sh
 sudo env BENCH_DROP_CACHES=1 scripts/bench.sh
@@ -393,8 +397,9 @@ sudo env BENCH_DROP_CACHES=1 scripts/bench.sh
 | `BENCH_KEEP` | `1` | フィクスチャを残す |
 | `BENCH_DROP_CACHES` | `0` | Linux でページキャッシュを落とす (root) |
 | `BENCH_DU` | `1` | `du -s` も計測する |
+| `BENCH_CANCEL_AFTER_MS` | `0` | 指定ミリ秒後に SIGINT を送り、中止応答を測る |
 
-出力は TSV です。Linux では `/proc` から RSS と I/O を取得し、macOS では `ps` から RSS/CPU を取得します (I/O は未対応)。Windows は WSL など bash が動く環境で実行してください。
+出力は TSV です。Linux では `/proc` から RSS と I/O を取得し、macOS では `ps` から RSS/CPU を取得します (I/O は未対応)。Windows は WSL など bash が動く環境で実行してください。`-cancel` 行の `wall_ms` は、SIGINT を送ってから終了するまでの時間です。
 
 結果は環境依存です。比較するときは、同じハードウェア・同じファイル構成・同じキャッシュ状態で測ってください。
 
