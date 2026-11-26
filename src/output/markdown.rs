@@ -46,6 +46,14 @@ pub(crate) fn write_markdown(
             "- **注意: アクセスできない項目があります。合計は不完全です**"
         )?;
     }
+    let blocked = outcome.tree.blocked_count();
+    if blocked > 0 {
+        writeln!(
+            w,
+            "- **注意: -x / --local-only により対象外のフォルダが {} 件あります (中身は集計されません)**",
+            count(blocked)
+        )?;
+    }
     writeln!(w)?;
 
     writeln!(w, "## サマリー")?;

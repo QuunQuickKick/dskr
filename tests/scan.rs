@@ -578,8 +578,10 @@ fn json_and_csv_reports() {
     #[cfg(not(unix))]
     assert!(s.contains("\"allocated\":12345"));
     assert!(s.contains("\"name\":\"a.bin\""));
+    assert!(s.contains("\"schema_version\":1"));
     assert!(s.contains("\"incomplete\":false"));
     assert!(s.contains("\"errors_truncated\":false"));
+    assert!(s.contains("\"blocked_folders\":0"));
     assert!(s.contains("\"allocated_collected\":true"));
     assert!(s.ends_with("}\n"));
 
@@ -588,7 +590,7 @@ fn json_and_csv_reports() {
     let s = String::from_utf8(csv).unwrap();
     assert!(
         s.starts_with(
-            "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected\n"
+            "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected,scan_blocked,schema_version\n"
         )
     );
     assert!(s.contains("a.bin,false,"));

@@ -75,6 +75,21 @@ pub(crate) fn write_report(
             )
         )?;
     }
+    let blocked = outcome.tree.blocked_count();
+    if blocked > 0 {
+        writeln!(
+            w,
+            "{}",
+            ansi(
+                &format!(
+                    "注意: -x / --local-only により対象外のフォルダが {} 件あります (中身は集計されません)",
+                    count(blocked)
+                ),
+                "33",
+                color
+            )
+        )?;
+    }
 
     let dirs = collect_top(
         outcome,

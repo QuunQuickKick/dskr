@@ -103,6 +103,14 @@ pub(crate) fn write_html(
             "<p class=\"warn\">注意: アクセスできない項目があります。合計は不完全です</p>"
         )?;
     }
+    let blocked = outcome.tree.blocked_count();
+    if blocked > 0 {
+        writeln!(
+            w,
+            "<p class=\"warn\">注意: -x / --local-only により対象外のフォルダが {} 件あります (中身は集計されません)</p>",
+            count(blocked)
+        )?;
+    }
 
     writeln!(w, "<div class=\"cards\">")?;
     card(w, "合計", &human_bytes(opts, total))?;
@@ -110,6 +118,9 @@ pub(crate) fn write_html(
     card(w, "ファイル数", &count(root.file_count))?;
     card(w, "フォルダ数", &count(root.dir_count))?;
     card(w, "エラー数", &count(meta.errors))?;
+    if blocked > 0 {
+        card(w, "対象外フォルダ", &count(blocked))?;
+    }
     writeln!(w, "</div>")?;
 
     let dirs = collect_top(

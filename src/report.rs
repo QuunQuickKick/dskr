@@ -7,6 +7,9 @@ use crate::scan::engine::ScanOutcome;
 use crate::scan::node::{NodeKind, Tree};
 use crate::timefmt::civil_from_days;
 
+/// JSON / CSV の公開スキーマバージョン。
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone)]
 pub struct ReportMeta {
     pub version: &'static str,
@@ -87,9 +90,11 @@ pub fn build_meta(
 
 pub fn write_json(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) -> io::Result<()> {
     let errors_truncated = meta.errors > outcome.errors.len() as u64;
+    let blocked = outcome.tree.blocked_count();
     write!(
         w,
-        "{{\"dskr_version\":{},\"generated_at\":{},\"root\":{},\"root_kind\":{},\"profile\":{},\"metric\":{},\"allocated_collected\":{},\"cancelled\":{},\"truncated\":{},\"incomplete\":{},\"errors_truncated\":{},\"stats\":{{\"entries\":{},\"dirs\":{},\"errors\":{},\"elapsed_ms\":{},\"threads\":{}}},\"options\":{},\"errors\":[",
+        "{{\"schema_version\":{},\"dskr_version\":{},\"generated_at\":{},\"root\":{},\"root_kind\":{},\"profile\":{},\"metric\":{},\"allocated_collected\":{},\"cancelled\":{},\"truncated\":{},\"incomplete\":{},\"errors_truncated\":{},\"blocked_folders\":{},\"stats\":{{\"entries\":{},\"dirs\":{},\"errors\":{},\"elapsed_ms\":{},\"threads\":{}}},\"options\":{},\"errors\":[",
+        SCHEMA_VERSION,
         jstr(meta.version),
         jstr(&meta.generated_at),
         jstr(&meta.root),
@@ -101,6 +106,7 @@ pub fn write_json(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) -
         meta.truncated,
         meta.errors > 0,
         errors_truncated,
+        blocked,
         meta.entries,
         meta.dirs,
         meta.errors,
@@ -218,9 +224,10 @@ pub fn create_private(path: &std::path::Path, exclusive: bool) -> io::Result<std
 }
 
 pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) -> io::Result<()> {
+    let blocked = outcome.tree.blocked_count();
     writeln!(
         w,
-        "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected"
+        "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected,scan_blocked,schema_version"
     )?;
     write_csv_node(
         w,
@@ -231,6 +238,7 @@ pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) ->
         meta.truncated,
         meta.errors,
         meta.allocated_collected,
+        blocked,
     )
 }
 
@@ -244,14 +252,16 @@ fn write_csv_node(
     scan_truncated: bool,
     scan_errors: u64,
     allocated_collected: bool,
+    scan_blocked: u64,
 ) -> io::Result<()> {
     let n = &t.nodes[i as usize];
     let name = n.name.to_string_lossy().into_owned();
     parts.push(name);
-    let p = parts.join("/");
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let p = parts.join(&sep);
     writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_field(&p),
         n.kind == NodeKind::Dir,
         n.total_alloc,
@@ -264,6 +274,8 @@ fn write_csv_node(
         scan_truncated,
         scan_errors,
         allocated_collected,
+        scan_blocked,
+        SCHEMA_VERSION,
     )?;
     let depth = parts.len();
     for &c in &n.children {
@@ -276,6 +288,7 @@ fn write_csv_node(
             scan_truncated,
             scan_errors,
             allocated_collected,
+            scan_blocked,
         )?;
         parts.truncate(depth);
     }

@@ -144,6 +144,14 @@ impl Tree {
         &self.nodes[i as usize]
     }
 
+    /// `-x` / `--local-only` などで走査対象外にしたフォルダ数。
+    pub fn blocked_count(&self) -> u64 {
+        self.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Blocked)
+            .count() as u64
+    }
+
     /// 子ノードを追加してそのインデックスを返す。容量上限超過時は親に
     /// truncated を立てて None を返す。
     /// ノード番号は u32 のため、u32::MAX を超える件数は保持できない。
@@ -361,6 +369,7 @@ mod tests {
         t.push_child_capped(0, Node::file("a".into(), 0, 1, 10, 10, 0), 100)
             .unwrap();
         t.aggregate();
+        assert_eq!(t.blocked_count(), 1);
         assert_eq!(t.node(b).kind, NodeKind::Blocked);
         assert_eq!(t.node(b).total_alloc, 0);
         assert_eq!(t.node(b).file_count, 0);

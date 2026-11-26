@@ -750,6 +750,27 @@ mod tests {
         output_for_test(&mut buf, &outcome, &meta, &opts(OutputFormat::Tree)).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("l (link)"), "{s}");
+
+        for format in [
+            OutputFormat::Report,
+            OutputFormat::Markdown,
+            OutputFormat::Html,
+        ] {
+            let mut buf = Vec::new();
+            output_for_test(&mut buf, &outcome, &meta, &opts(format)).unwrap();
+            let s = String::from_utf8(buf).unwrap();
+            assert!(s.contains("対象外"), "{format:?}: {s}");
+        }
+
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.contains("\"blocked_folders\":1"), "{s}");
+
+        let mut csv = Vec::new();
+        crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
+        let s = String::from_utf8(csv).unwrap();
+        assert!(s.contains("scan_blocked,schema_version"), "{s}");
     }
 
     #[test]
@@ -816,14 +837,13 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         let mut lines = s.lines();
         assert!(
-            lines
-                .next()
-                .unwrap()
-                .ends_with("truncated,cancelled,scan_truncated,scan_errors,allocated_collected"),
+            lines.next().unwrap().ends_with(
+                "truncated,cancelled,scan_truncated,scan_errors,allocated_collected,scan_blocked,schema_version"
+            ),
             "{s}"
         );
         let root = lines.next().unwrap();
-        assert!(root.ends_with(",false,true,true,2,true"), "{root}");
+        assert!(root.ends_with(",false,true,true,2,true,0,1"), "{root}");
     }
 
     #[test]
