@@ -320,7 +320,7 @@ not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 
-## 依存クレート (92 件)
+## 依存クレート (93 件)
 
 | クレート | バージョン | ライセンス | 著作権者 | リポジトリ |
 |---|---|---|---|---|
@@ -344,20 +344,21 @@ authorization of the copyright holder.
 |crossbeam-utils|0.8.23|MIT OR Apache-2.0|-|https://github.com/crossbeam-rs/crossbeam|
 |crossterm|0.28.1|MIT|T. Post|https://github.com/crossterm-rs/crossterm|
 |crossterm_winapi|0.9.1|MIT|T. Post|https://github.com/crossterm-rs/crossterm-winapi|
-|darling|0.24.1|MIT|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/darling|
-|darling_core|0.24.1|MIT|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/darling|
-|darling_macro|0.24.1|MIT|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/darling|
+|darling|0.20.11|MIT|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/darling|
+|darling_core|0.20.11|MIT|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/darling|
+|darling_macro|0.20.11|MIT|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/darling|
 |either|1.19.0|MIT OR Apache-2.0|-|https://github.com/rayon-rs/either|
 |equivalent|1.0.3|Apache-2.0 OR MIT|-|https://github.com/indexmap-rs/equivalent|
 |errno|0.3.15|MIT OR Apache-2.0|Chris Wong &lt;lambda.fairy@gmail.com&gt;;Dan Gohman &lt;dev@sunfishcode.online&gt;|https://github.com/lambda-fairy/rust-errno|
 |fastrand|2.5.0|Apache-2.0 OR MIT|Stjepan Glavina &lt;stjepang@gmail.com&gt;|https://github.com/smol-rs/fastrand|
+|fnv|1.0.7|Apache-2.0 / MIT|Alex Crichton &lt;alex@alexcrichton.com&gt;|https://github.com/servo/rust-fnv|
 |foldhash|0.1.5|Zlib|Orson Peters &lt;orsonpeters@gmail.com&gt;|https://github.com/orlp/foldhash|
 |getrandom|0.4.3|MIT OR Apache-2.0|The Rand Project Developers|https://github.com/rust-random/getrandom|
 |hashbrown|0.15.5|MIT OR Apache-2.0|Amanieu d'Antras &lt;amanieu@gmail.com&gt;|https://github.com/rust-lang/hashbrown|
 |heck|0.5.0|MIT OR Apache-2.0|-|https://github.com/withoutboats/heck|
 |ident_case|1.0.1|MIT/Apache-2.0|Ted Driggs &lt;ted.driggs@outlook.com&gt;|https://github.com/TedDriggs/ident_case|
 |indoc|2.0.8|MIT OR Apache-2.0|David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/dtolnay/indoc|
-|instability|0.3.14|MIT|Stephen M. Coakley &lt;me@stephencoakley.com&gt;;The Ratatui Developers|https://github.com/ratatui/instability|
+|instability|0.3.10|MIT|Stephen M. Coakley &lt;me@stephencoakley.com&gt;;The Ratatui Developers|https://github.com/ratatui/instability|
 |is_terminal_polyfill|1.70.2|MIT OR Apache-2.0|-|https://github.com/polyfill-rs/is_terminal_polyfill|
 |itertools|0.13.0|MIT OR Apache-2.0|bluss|https://github.com/rust-itertools/itertools|
 |itoa|1.0.19|MIT OR Apache-2.0|David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/dtolnay/itoa|
