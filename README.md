@@ -5,7 +5,7 @@
 ターミナルで確認できるツールです。Windows / macOS / Linux で動作する
 単一バイナリとして配布できます。
 
-> 詳細な使い方、OS ごとの対応表、トラブルシューティングは [USAGE.md](USAGE.md) を参照してください。`dskr --help` は実行する OS に合わせた内容を表示します。
+> 詳細な使い方、OS ごとの対応表、トラブルシューティングは [USAGE.md](USAGE.md) を参照してください。サイズの数え方や `du` との違いは [ACCURACY.md](ACCURACY.md) にまとめています。`dskr --help` は実行する OS に合わせた内容を表示します。
 
 ```text
 dskr レポート
@@ -67,7 +67,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -T
 | オプション | 意味 |
 |---|---|
 | `-Test` | ビルド前に `cargo test --release` を実行 |
-| `-Zip` | `dskr.exe` + README + USAGE + LICENSE + ハッシュを同梱した zip を `dist\` に作成 |
+| `-Zip` | `dskr.exe` + README + USAGE + ACCURACY + LICENSE + ハッシュを同梱した zip を `dist\` に作成 |
 | `-Clean` | 事前に `cargo clean` |
 | `-NoSmoke` | 生成した exe の起動確認を省略 |
 | `-Offline` | `vendor/` を使ったオフラインビルド |
@@ -90,6 +90,7 @@ dskr-<version>-windows-x86_64\
 ├── dskr.exe
 ├── README.md
 ├── USAGE.md
+├── ACCURACY.md
 ├── LICENSE
 ├── THIRD-PARTY-LICENSES.md
 └── SHA256SUMS.txt

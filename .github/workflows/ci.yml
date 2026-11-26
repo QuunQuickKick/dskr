@@ -102,7 +102,7 @@ jobs:
           }
 
           $packageDir = $top[0].FullName
-          $expected = @('dskr.exe', 'README.md', 'USAGE.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md', 'SHA256SUMS.txt') | Sort-Object
+          $expected = @('dskr.exe', 'README.md', 'USAGE.md', 'ACCURACY.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md', 'SHA256SUMS.txt') | Sort-Object
           $actual = @(Get-ChildItem -Path $packageDir | Select-Object -ExpandProperty Name) | Sort-Object
           $diff = Compare-Object -ReferenceObject $expected -DifferenceObject $actual
           if ($diff) {

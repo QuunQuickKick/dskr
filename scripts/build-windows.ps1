@@ -15,7 +15,7 @@
     ビルド前に cargo test を実行します。
 
 .PARAMETER Zip
-    README / USAGE / ライセンス / SHA256SUMS.txt をバージョン付きフォルダに
+    README / USAGE / ACCURACY / ライセンス / SHA256SUMS.txt をバージョン付きフォルダに
     同梱した配布用 zip を作成します。zip 自体の SHA-256 も dist に出力します。
 
 .PARAMETER Clean
@@ -363,7 +363,7 @@ Rust (cargo) が見つかりません。次のいずれかで導入してくだ�
     if ($Zip) {
         Write-Step 'zip を作成しています'
         $packageName = "dskr-" + $version + "-" + $suffix
-        $documents = @('README.md', 'USAGE.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md')
+        $documents = @('README.md', 'USAGE.md', 'ACCURACY.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md')
 
         # 同梱物が欠けたまま配布しないよう、先に存在確認する。
         $missing = @()
