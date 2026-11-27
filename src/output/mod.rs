@@ -647,41 +647,116 @@ mod tests {
         out
     }
 
-    fn json_names(value: &serde_json::Value) -> Vec<String> {
-        let mut out = Vec::new();
-        let Some(root) = value.get("tree") else {
-            panic!("JSON tree がない");
-        };
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            out.push(
-                node.get("name")
-                    .and_then(|v| v.as_str())
-                    .expect("JSON name")
-                    .to_string(),
-            );
-            if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-                for child in children.iter().rev() {
-                    stack.push(child);
-                }
-            }
-        }
-        out
+    #[derive(serde::Deserialize)]
+    struct JsonReport {
+        schema_version: u32,
+        dskr_version: String,
+        generated_at: String,
+        root: String,
+        root_kind: String,
+        profile: String,
+        metric: String,
+        allocated_collected: bool,
+        cancelled: bool,
+        truncated: bool,
+        incomplete: bool,
+        errors_truncated: bool,
+        blocked_folders: u64,
+        stats: JsonStats,
+        options: serde_json::Value,
+        errors: Vec<JsonError>,
+        tree: JsonNode,
     }
 
-    fn parse_json_names_in_large_stack(bytes: &[u8]) -> Vec<String> {
-        let bytes = bytes.to_vec();
+    #[derive(serde::Deserialize)]
+    struct JsonStats {
+        entries: u64,
+        dirs: u64,
+        errors: u64,
+        elapsed_ms: u64,
+        threads: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct JsonError {
+        path: String,
+        message: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct JsonNode {
+        name: String,
+        #[serde(rename = "type")]
+        kind: String,
+        allocated: u64,
+        logical: u64,
+        files: u64,
+        dirs: u64,
+        errors: u64,
+        mtime: Option<i64>,
+        truncated: bool,
+        #[serde(default)]
+        children: Vec<JsonNode>,
+    }
+
+    fn kind_label(kind: NodeKind) -> &'static str {
+        match kind {
+            NodeKind::Dir => "dir",
+            NodeKind::File => "file",
+            NodeKind::Other => "other",
+            NodeKind::Blocked => "blocked",
+        }
+    }
+
+    struct ParsedJson {
+        names: Vec<String>,
+        max_depth: usize,
+        deepest: String,
+    }
+
+    fn parse_json_in_large_stack(bytes: &[u8]) -> ParsedJson {
+        let text = std::str::from_utf8(bytes)
+            .expect("UTF-8 の JSON")
+            .to_string();
         std::thread::Builder::new()
             .name("dskr-json-parse".into())
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 use serde::Deserialize;
-                let mut de = serde_json::Deserializer::from_slice(&bytes);
+                // serde_json::from_str は再帰上限を解除できないため、
+                // 深い階層では Deserializer::from_str を使う。
+                let mut de = serde_json::Deserializer::from_str(&text);
                 de.disable_recursion_limit();
                 let value = serde_json::Value::deserialize(&mut de).expect("JSON を再読込できる");
                 de.end().expect("末尾に余分なデータがない");
                 // 64MiB スタック上で Value を破棄する (深い入れ子の drop 対策)。
-                json_names(&value)
+                let root = value.get("tree").expect("JSON tree がない");
+                let mut names = Vec::new();
+                let mut max_depth = 0usize;
+                let mut deepest = String::new();
+                let mut stack = vec![(root, 0usize)];
+                while let Some((node, depth)) = stack.pop() {
+                    let name = node
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .expect("JSON name")
+                        .to_string();
+                    names.push(name.clone());
+                    if depth >= max_depth {
+                        max_depth = depth;
+                        deepest = name;
+                    }
+                    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+                        for child in children.iter().rev() {
+                            stack.push((child, depth + 1));
+                        }
+                    }
+                }
+                ParsedJson {
+                    names,
+                    max_depth,
+                    deepest,
+                }
             })
             .unwrap()
             .join()
@@ -990,7 +1065,146 @@ mod tests {
     }
 
     #[test]
-    fn deep_json_is_reparseable_and_keeps_order() {
+    fn json_round_trip_validates_schema_types_and_order() {
+        let (outcome, meta) = fixture();
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+
+        let report: JsonReport = serde_json::from_str(&s).expect("JSON を全体再解析できる");
+        assert_eq!(report.schema_version, crate::report::SCHEMA_VERSION);
+        assert_eq!(report.dskr_version, "test");
+        assert_eq!(report.generated_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(report.root, "/root");
+        assert_eq!(report.root_kind, "local");
+        assert_eq!(report.profile, "local");
+        assert_eq!(report.metric, "allocated");
+        assert!(report.allocated_collected);
+        assert!(!report.cancelled);
+        assert!(!report.truncated);
+        assert!(!report.incomplete);
+        assert!(!report.errors_truncated);
+        assert_eq!(report.blocked_folders, 0);
+        assert_eq!(report.stats.entries, meta.entries);
+        assert_eq!(report.stats.dirs, meta.dirs);
+        assert_eq!(report.stats.errors, meta.errors);
+        assert_eq!(report.stats.elapsed_ms, meta.elapsed_ms as u64);
+        assert_eq!(report.stats.threads, meta.threads as u64);
+        assert!(report.options.is_object(), "{:?}", report.options);
+        assert!(report.errors.is_empty());
+        assert_eq!(report.tree.name, "/root");
+        assert_eq!(report.tree.kind, "dir");
+        assert_eq!(report.tree.mtime, None);
+
+        // 親子関係と兄弟の順序を Tree と突き合わせる。
+        let mut stack = vec![(&report.tree, outcome.tree.root)];
+        let mut seen = 0usize;
+        while let Some((jn, idx)) = stack.pop() {
+            let n = outcome.tree.node(idx);
+            seen += 1;
+            assert_eq!(jn.name, n.name.to_string_lossy());
+            assert_eq!(jn.kind, kind_label(n.kind));
+            assert_eq!(jn.allocated, n.total_alloc);
+            assert_eq!(jn.logical, n.total_logical);
+            assert_eq!(jn.files, n.file_count);
+            assert_eq!(jn.dirs, n.dir_count);
+            assert_eq!(jn.errors, u64::from(n.err_count));
+            assert_eq!(jn.mtime, if n.mtime == 0 { None } else { Some(n.mtime) });
+            assert_eq!(jn.truncated, n.truncated);
+            assert_eq!(jn.children.len(), n.children.len());
+            for (child_json, &child_idx) in jn.children.iter().zip(&n.children) {
+                stack.push((child_json, child_idx));
+            }
+        }
+        assert_eq!(seen, outcome.tree.nodes.len());
+    }
+
+    #[test]
+    fn json_round_trip_escapes_unicode_newline_quote_and_backslash() {
+        let names = [
+            "空 白",
+            "line\nbreak",
+            "quote\"x",
+            "back\\slash",
+            "tab\tname",
+            "ctrl\u{1}name",
+        ];
+        let mut tree = Tree::with_root("/root".into(), 0);
+        for (i, name) in names.iter().enumerate() {
+            tree.push_child_capped(0, Node::file((*name).into(), 0, 1, 1, 1, i as i64), 100)
+                .unwrap();
+        }
+        tree.aggregate();
+        let outcome = ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: names.len() as u64,
+            dirs: 0,
+            error_count: 0,
+            bytes_alloc: names.len() as u64,
+            bytes_logical: names.len() as u64,
+            elapsed: Duration::from_millis(1),
+            root: PathBuf::from("/root"),
+        };
+        let (_, meta) = fixture();
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+
+        let report: JsonReport =
+            serde_json::from_str(&s).expect("特殊文字を含む JSON を再解析できる");
+        let actual: Vec<&str> = report
+            .tree
+            .children
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(actual, names);
+
+        assert!(s.contains("\\n"), "改行をエスケープする: {s}");
+        assert!(s.contains("\\\""), "引用符をエスケープする: {s}");
+        assert!(s.contains("\\\\"), "バックスラッシュをエスケープする: {s}");
+        assert!(s.contains("\\t"), "タブをエスケープする: {s}");
+        assert!(s.contains("\\u0001"), "制御文字をエスケープする: {s}");
+    }
+
+    #[test]
+    fn json_round_trip_reports_incomplete_and_truncated_errors() {
+        let (mut outcome, mut meta) = fixture();
+        outcome.error_count = 1005;
+        outcome.errors.push(crate::scan::engine::ScanError {
+            path: "/root/a\nb".into(),
+            message: "quote\"\\".into(),
+        });
+        outcome.errors.push(crate::scan::engine::ScanError {
+            path: "/root/denied".into(),
+            message: "permission denied".into(),
+        });
+        meta.errors = 1005;
+        meta.truncated = true;
+        meta.cancelled = true;
+
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        let report: JsonReport = serde_json::from_str(&s).expect("エラー情報を再解析できる");
+
+        assert!(report.incomplete);
+        assert!(report.errors_truncated);
+        assert!(report.truncated);
+        assert!(report.cancelled);
+        assert_eq!(report.stats.errors, 1005);
+        assert_eq!(report.errors.len(), 2);
+        assert_eq!(report.errors[0].path, "/root/a\nb");
+        assert_eq!(report.errors[0].message, "quote\"\\");
+        assert_eq!(report.errors[1].path, "/root/denied");
+    }
+
+    #[test]
+    fn deep_json_full_parse_reaches_deepest_node() {
         let (_, meta) = fixture();
         let outcome = deep_outcome(10_000);
         let mut json = Vec::new();
@@ -998,10 +1212,12 @@ mod tests {
         assert!(json.ends_with(b"}\n"));
 
         let expected = preorder_names(&outcome.tree);
-        let actual = parse_json_names_in_large_stack(&json);
-        assert_eq!(actual.len(), 10_002);
-        assert_eq!(actual, expected);
-        assert_eq!(actual.last().map(String::as_str), Some("leaf"));
+        let actual = parse_json_in_large_stack(&json);
+        assert_eq!(actual.names.len(), 10_002);
+        assert_eq!(actual.names, expected);
+        assert_eq!(actual.names.last().map(String::as_str), Some("leaf"));
+        assert_eq!(actual.max_depth, 10_001);
+        assert_eq!(actual.deepest, "leaf");
     }
 
     #[test]
@@ -1088,7 +1304,7 @@ mod tests {
         let expected = preorder_names(&outcome.tree);
         let mut json = Vec::new();
         crate::report::write_json(&mut json, &outcome, &meta).unwrap();
-        assert_eq!(parse_json_names_in_large_stack(&json), expected);
+        assert_eq!(parse_json_in_large_stack(&json).names, expected);
 
         let mut csv = Vec::new();
         crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
@@ -1124,7 +1340,7 @@ mod tests {
         let mut json = Vec::new();
         crate::report::write_json(&mut json, &outcome, &meta).unwrap();
         assert_eq!(
-            parse_json_names_in_large_stack(&json),
+            parse_json_in_large_stack(&json).names,
             vec![
                 "/root".to_string(),
                 "空 白,quote\"x".to_string(),

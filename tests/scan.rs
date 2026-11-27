@@ -26,6 +26,7 @@ fn cfg(root: &Path) -> EngineConfig {
         want_identity: false,
         skip_pseudo: false,
         network: false,
+        root_is_network: false,
         local_only: false,
     }
 }
@@ -672,6 +673,92 @@ fn identity_is_collected_only_when_requested() {
         dskr::scan::node::FileId::UNKNOWN,
         "ID を要求していないスキャンでは保持しない"
     );
+}
+
+#[test]
+fn network_identity_is_suppressed_for_all_node_kinds() {
+    use dskr::scan::node::FileId;
+
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    fs::write(&file, b"x").unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("b.txt"), b"y").unwrap();
+    #[cfg(unix)]
+    let link = {
+        use std::os::unix::fs::symlink;
+        let link = dir.path().join("link");
+        symlink(&file, &link).unwrap();
+        link
+    };
+
+    let mut last = None;
+    // ネットワークプロファイルと、Windows のネットワークルート検出の
+    // どちらでも ID を収集しない。
+    for (network, root_is_network) in [(true, false), (false, true)] {
+        let mut c = cfg(dir.path());
+        c.want_identity = true;
+        c.network = network;
+        c.root_is_network = root_is_network;
+        let out = scan(dir.path(), c);
+
+        assert!(out.tree.nodes.len() >= 4);
+        for i in 0..out.tree.nodes.len() {
+            assert_eq!(
+                out.tree.id(i as u32),
+                FileId::UNKNOWN,
+                "ネットワーク時は全ノードで ID を保持しない (node {i})"
+            );
+            assert!(!out.tree.id_link_like(i as u32));
+        }
+        last = Some(out);
+    }
+    let out = last.unwrap();
+
+    // ルート・ディレクトリ・ファイル・リンクのすべてで削除を拒否する。
+    let root_kind = dskr::scan::node::NodeKind::Dir;
+    let err = dskr::delete::check_target(dir.path(), root_kind, out.tree.id(0), false).unwrap_err();
+    assert!(err.contains("走査時"), "{err}");
+
+    let file_idx = child(&out, "a.txt").unwrap();
+    let file_node = out.tree.node(file_idx);
+    let err = dskr::delete::remove_target(
+        &file,
+        file_node.kind,
+        out.tree.id(file_idx),
+        out.tree.id_link_like(file_idx),
+    )
+    .unwrap_err();
+    assert!(err.contains("走査時"), "{err}");
+    assert!(file.exists());
+
+    let sub_idx = child(&out, "sub").unwrap();
+    let sub_node = out.tree.node(sub_idx);
+    let err = dskr::delete::remove_target(
+        &sub,
+        sub_node.kind,
+        out.tree.id(sub_idx),
+        out.tree.id_link_like(sub_idx),
+    )
+    .unwrap_err();
+    assert!(err.contains("走査時"), "{err}");
+    assert!(sub.exists());
+
+    #[cfg(unix)]
+    {
+        let link_idx = child(&out, "link").unwrap();
+        let link_node = out.tree.node(link_idx);
+        let err = dskr::delete::remove_target(
+            &link,
+            link_node.kind,
+            out.tree.id(link_idx),
+            out.tree.id_link_like(link_idx),
+        )
+        .unwrap_err();
+        assert!(err.contains("走査時"), "{err}");
+        assert!(link.exists());
+    }
 }
 
 #[cfg(unix)]

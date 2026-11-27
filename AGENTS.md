@@ -75,6 +75,7 @@ aarch64 + x86_64 の universal2 tar.gz を作る。Xcode Command Line Tools と
 - `src/app.rs` / `src/ui.rs` — TUI の状態と描画。
 - `src/delete.rs` — 削除前のファイル ID 検証。`--allow-delete` 時のみ走査時に
   ID を収集し、削除直前に再取得して照合する。リンク先は辿らない。
+  ネットワークプロファイルと Windows のネットワークパスでは収集しない。
 
 ## テストの注意点
 

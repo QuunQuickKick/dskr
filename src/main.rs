@@ -158,6 +158,7 @@ fn try_main(cli: Cli) -> Result<u32, String> {
         want_identity: cli.allow_delete,
         skip_pseudo,
         network: network_profile,
+        root_is_network: kind.is_network(),
         local_only: cli.local_only,
     };
 
@@ -191,6 +192,15 @@ fn try_main(cli: Cli) -> Result<u32, String> {
         );
     }
 
+    let delete_blocked_reason = if cli.allow_delete {
+        cfg.identity_blocked_reason().map(str::to_string)
+    } else {
+        None
+    };
+    if let Some(reason) = &delete_blocked_reason {
+        eprintln!("警告: {reason}");
+    }
+
     if headless_requested(&cli) {
         headless(
             &cli,
@@ -215,6 +225,7 @@ fn try_main(cli: Cli) -> Result<u32, String> {
             threads,
             show_allocated: want_allocated,
             allow_delete: cli.allow_delete,
+            delete_blocked_reason,
             options_json,
             sort_spec,
             size_format,
@@ -442,6 +453,7 @@ struct TuiParams {
     threads: usize,
     show_allocated: bool,
     allow_delete: bool,
+    delete_blocked_reason: Option<String>,
     options_json: String,
     sort_spec: SortSpec,
     size_format: SizeFormat,
@@ -491,6 +503,7 @@ fn run_tui(p: TuiParams) -> Result<(u32, bool), String> {
         threads,
         show_allocated,
         allow_delete,
+        delete_blocked_reason,
         options_json,
         sort_spec,
         size_format,
@@ -536,6 +549,7 @@ fn run_tui(p: TuiParams) -> Result<(u32, bool), String> {
     app.sort_field = sort_spec.field;
     app.sort_dir = sort_spec.dir;
     app.size_format = size_format;
+    app.delete_blocked_reason = delete_blocked_reason;
 
     loop {
         app.paused = app.control.state() == ControlState::Paused;

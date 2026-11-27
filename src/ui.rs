@@ -689,63 +689,75 @@ fn draw_confirm_delete(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        fit_width(" この操作は取り消せません。", inner_w),
-        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-    )));
-    if target.kind == NodeKind::Dir {
+    if let Some(reason) = &target.blocked_reason {
         lines.push(Line::from(Span::styled(
-            fit_width(" フォルダの中身もすべて削除されます。", inner_w),
-            Style::new().fg(Color::Red),
+            fit_width(&format!(" {reason}"), inner_w),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
-        if target.truncated {
-            lines.push(Line::from(Span::styled(
-                fit_width(
-                    " 表示・集計されていない項目も含まれる可能性があります。",
-                    inner_w,
-                ),
-                Style::new().fg(Color::Red),
-            )));
-        }
-    } else if target.kind == NodeKind::Other {
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            fit_width(" リンク先は削除せず、リンク自体だけを削除します。", inner_w),
-            Style::new(),
-        )));
-    } else if target.kind == NodeKind::Blocked {
-        lines.push(Line::from(Span::styled(
-            fit_width(
-                " 走査していない項目です。空のフォルダしか削除できません。",
-                inner_w,
-            ),
-            Style::new().fg(Color::Yellow),
-        )));
-    }
-    if app.profile_label == "network" {
-        lines.push(Line::from(Span::styled(
-            fit_width(" ネットワーク上の項目です。", inner_w),
-            Style::new().fg(Color::Yellow),
-        )));
-    }
-    lines.push(Line::from(""));
-
-    if target.kind == NodeKind::Dir {
-        lines.push(Line::from(vec![
-            Span::styled(" 確認のため yes と入力: ", Style::new()),
-            Span::styled(
-                format!("[ {} ]", target.input),
-                Style::new().bg(SELECTED_BG).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            fit_width(" [Enter] 削除   [Esc] キャンセル", inner_w),
+            fit_width(" [Esc] 閉じる", inner_w),
             dim,
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            fit_width(" [y] 削除   [Esc] キャンセル", inner_w),
-            Style::new().fg(Color::Yellow),
+            fit_width(" この操作は取り消せません。", inner_w),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
+        if target.kind == NodeKind::Dir {
+            lines.push(Line::from(Span::styled(
+                fit_width(" フォルダの中身もすべて削除されます。", inner_w),
+                Style::new().fg(Color::Red),
+            )));
+            if target.truncated {
+                lines.push(Line::from(Span::styled(
+                    fit_width(
+                        " 表示・集計されていない項目も含まれる可能性があります。",
+                        inner_w,
+                    ),
+                    Style::new().fg(Color::Red),
+                )));
+            }
+        } else if target.kind == NodeKind::Other {
+            lines.push(Line::from(Span::styled(
+                fit_width(" リンク先は削除せず、リンク自体だけを削除します。", inner_w),
+                Style::new(),
+            )));
+        } else if target.kind == NodeKind::Blocked {
+            lines.push(Line::from(Span::styled(
+                fit_width(
+                    " 走査していない項目です。空のフォルダしか削除できません。",
+                    inner_w,
+                ),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
+        if app.profile_label == "network" {
+            lines.push(Line::from(Span::styled(
+                fit_width(" ネットワーク上の項目です。", inner_w),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(""));
+
+        if target.kind == NodeKind::Dir {
+            lines.push(Line::from(vec![
+                Span::styled(" 確認のため yes と入力: ", Style::new()),
+                Span::styled(
+                    format!("[ {} ]", target.input),
+                    Style::new().bg(SELECTED_BG).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                fit_width(" [Enter] 削除   [Esc] キャンセル", inner_w),
+                dim,
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                fit_width(" [y] 削除   [Esc] キャンセル", inner_w),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
     }
     lines.push(match &target.error {
         Some(err) => Line::from(Span::styled(
@@ -1000,6 +1012,7 @@ mod tests {
             files: 3,
             dirs: 1,
             truncated: true,
+            blocked_reason: None,
             input: "ye".to_string(),
             error: Some("確認のため yes と入力してください".to_string()),
         });
@@ -1012,6 +1025,38 @@ mod tests {
         assert!(compact.contains("中身もすべて削除"), "{text}");
         assert!(compact.contains("集計されていない"), "{text}");
         assert!(compact.contains("yes"), "{text}");
+    }
+
+    #[test]
+    fn delete_dialog_explains_network_block_without_confirm() {
+        let mut app = test_app();
+        app.allow_delete = true;
+        app.scanning = false;
+        app.mode = Mode::ConfirmDelete;
+        app.delete_target = Some(DeleteTarget {
+            node: 1,
+            path: std::path::PathBuf::from("/tmp/victim"),
+            kind: NodeKind::File,
+            expected: crate::scan::node::FileId::UNKNOWN,
+            expected_link_like: false,
+            bytes: 1024,
+            files: 0,
+            dirs: 0,
+            truncated: false,
+            blocked_reason: Some(
+                "ネットワークプロファイルではファイル ID を収集しないため削除できません".into(),
+            ),
+            input: String::new(),
+            error: None,
+        });
+
+        let text = render(&mut app, 100, 30);
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("ネットワークプロファイル"), "{text}");
+        assert!(compact.contains("削除できません"), "{text}");
+        assert!(compact.contains("[Esc]閉じる"), "{text}");
+        assert!(!compact.contains("[y]削除"), "{text}");
+        assert!(!compact.contains("取り消せません"), "{text}");
     }
 
     #[test]

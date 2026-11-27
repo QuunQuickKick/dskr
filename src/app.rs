@@ -54,6 +54,8 @@ pub struct DeleteTarget {
     pub files: u64,
     pub dirs: u64,
     pub truncated: bool,
+    /// ネットワーク等の理由で削除できない場合の説明。
+    pub blocked_reason: Option<String>,
     /// フォルダ削除時に「yes」と入力させるためのバッファ。
     pub input: String,
     pub error: Option<String>,
@@ -80,6 +82,8 @@ pub struct App {
     /// Windows のネットワークプロファイルでは取得しないことがある。
     pub alloc_collected: bool,
     pub allow_delete: bool,
+    /// ネットワーク等の理由で削除処理全体を使用できない場合の説明。
+    pub delete_blocked_reason: Option<String>,
     pub delete_target: Option<DeleteTarget>,
     pub outcome: Option<ScanOutcome>,
     pub stack: Vec<u32>,
@@ -148,6 +152,7 @@ impl App {
             show_allocated,
             alloc_collected,
             allow_delete,
+            delete_blocked_reason: None,
             delete_target: None,
             outcome: None,
             stack: vec![0],
@@ -359,6 +364,26 @@ impl App {
         let path = self.path_of(idx);
         let expected = t.id(idx);
         let expected_link_like = t.id_link_like(idx);
+        if let Some(reason) = self.delete_blocked_reason.clone() {
+            // ネットワーク等では走査時に ID を収集していない。削除確認を開いて
+            // 理由を示し、確定操作は受け付けない。
+            self.delete_target = Some(DeleteTarget {
+                node: idx,
+                path,
+                kind: recorded_kind,
+                expected,
+                expected_link_like,
+                bytes,
+                files,
+                dirs,
+                truncated,
+                blocked_reason: Some(reason),
+                input: String::new(),
+                error: None,
+            });
+            self.mode = Mode::ConfirmDelete;
+            return;
+        }
         let kind = match delete::check_target(&path, recorded_kind, expected, expected_link_like) {
             Ok(kind) => kind,
             Err(e) => {
@@ -385,6 +410,7 @@ impl App {
             files,
             dirs,
             truncated,
+            blocked_reason: None,
             input: String::new(),
             error: None,
         });
@@ -393,6 +419,25 @@ impl App {
 
     fn on_key_confirm_delete(&mut self, key: KeyEvent) {
         use KeyCode::*;
+        if let Some(reason) = self
+            .delete_target
+            .as_ref()
+            .and_then(|t| t.blocked_reason.clone())
+        {
+            match key.code {
+                Esc => {
+                    self.delete_target = None;
+                    self.mode = Mode::Normal;
+                    self.message = Some("削除をキャンセルしました".into());
+                }
+                _ => {
+                    if let Some(t) = self.delete_target.as_mut() {
+                        t.error = Some(reason);
+                    }
+                }
+            }
+            return;
+        }
         let is_dir = self
             .delete_target
             .as_ref()
@@ -434,6 +479,16 @@ impl App {
     }
 
     fn perform_delete(&mut self) {
+        if let Some(reason) = self
+            .delete_target
+            .as_ref()
+            .and_then(|t| t.blocked_reason.clone())
+        {
+            if let Some(t) = self.delete_target.as_mut() {
+                t.error = Some(reason);
+            }
+            return;
+        }
         let Some(target) = self.delete_target.take() else {
             self.mode = Mode::Normal;
             return;
@@ -1280,6 +1335,7 @@ mod tests {
             files: 1,
             dirs: 0,
             truncated: false,
+            blocked_reason: None,
             input: "yes".into(),
             error: None,
         });
@@ -1335,6 +1391,40 @@ mod tests {
         assert!(app.delete_target.is_none());
         assert!(file.exists());
         assert!(app.message.as_deref().unwrap_or("").contains("走査中"));
+    }
+
+    #[test]
+    fn network_blocked_delete_is_shown_and_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("victim.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "victim.txt");
+        app.delete_blocked_reason =
+            Some("ネットワークプロファイルではファイル ID を収集しないため削除できません".into());
+
+        app.begin_delete();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        let target = app.delete_target.as_ref().expect("確認画面を開く");
+        assert!(target.blocked_reason.is_some());
+
+        app.on_key_confirm_delete(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(file.exists(), "確定操作で削除してはいけない");
+        assert!(app.delete_target.is_some(), "確認画面は維持する");
+        assert!(
+            app.delete_target
+                .as_ref()
+                .and_then(|t| t.error.as_deref())
+                .unwrap_or("")
+                .contains("ネットワークプロファイル"),
+            "{:?}",
+            app.delete_target.as_ref().and_then(|t| t.error.as_deref())
+        );
+
+        app.on_key_confirm_delete(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.delete_target.is_none());
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

@@ -170,8 +170,33 @@ pub struct EngineConfig {
     /// Windows では追加のネットワーク往復を避けるためハードリンク判定を省略し、
     /// リンク追従は同一ボリュームに制限する。
     pub network: bool,
+    /// ルートが Windows の UNC / ネットワークドライブか。
+    /// `--profile local` を明示してもネットワーク上の ID 収集を避ける。
+    pub root_is_network: bool,
     /// --local-only: ネットワークFSへの走査を一切行わない。
     pub local_only: bool,
+}
+
+impl EngineConfig {
+    /// 削除時の同一性検証用 ID を収集するか。
+    ///
+    /// ネットワークプロファイルでは、追加のネットワーク往復とサーバ依存の
+    /// 不安定な ID を避けるため収集しない。Windows の UNC / ネットワーク
+    /// ドライブは `--profile local` 指定時も同様に収集しない。
+    pub fn collect_identity(&self) -> bool {
+        self.want_identity && self.identity_blocked_reason().is_none()
+    }
+
+    /// ネットワークのために ID 収集を停止している理由。
+    pub fn identity_blocked_reason(&self) -> Option<&'static str> {
+        if self.network {
+            Some("ネットワークプロファイルではファイル ID を収集しないため削除できません")
+        } else if self.root_is_network {
+            Some("ネットワーク上のパスではファイル ID を収集しないため削除できません")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -332,7 +357,7 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
     let root_volume = platform::volume_of(&fs_root);
 
     let mut initial_tree = Tree::with_root(cfg.root.as_os_str().to_owned(), root_mtime);
-    if cfg.want_identity {
+    if cfg.collect_identity() {
         if let Some(md) = &root_md {
             if let Some(id) = platform::file_id(md, &fs_root, false) {
                 initial_tree.set_id(0, id, false);
@@ -797,9 +822,11 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
             for (n, hardlink, identity) in batch {
                 match sh.push_locked(&mut t, node, n) {
                     Some(idx) => {
-                        if let Some(identity) = identity {
-                            if identity.id.is_known() {
-                                t.set_id(idx, identity.id, identity.link_like);
+                        if sh.cfg.collect_identity() {
+                            if let Some(identity) = identity {
+                                if identity.id.is_known() {
+                                    t.set_id(idx, identity.id, identity.link_like);
+                                }
                             }
                         }
                         if let Some(key) = hardlink {
@@ -900,7 +927,7 @@ impl Shared {
 
     /// 削除時の同一性検証用 ID。要求されていない場合は None。
     fn identity(&self, md: &Metadata, path: &Path, link_like: bool) -> Option<NodeIdentity> {
-        if !self.cfg.want_identity {
+        if !self.cfg.collect_identity() {
             return None;
         }
         platform::file_id(md, path, link_like).map(|id| NodeIdentity { id, link_like })
@@ -932,12 +959,13 @@ impl Shared {
         // そうしないと TUI の「ディスク使用量」切替や JSON の allocated が
         // 見かけのサイズになってしまう。ネットワークでは余計な往復を避ける。
         let collect_alloc = self.cfg.want_allocated || (cfg!(windows) && !self.cfg.network);
+        let collect_identity = self.cfg.collect_identity();
         let info = platform::file_size_info(
             md,
             path,
             collect_alloc,
             self.want_hardlink(),
-            self.cfg.want_identity,
+            collect_identity,
         );
         if collect_alloc && !info.alloc_exact {
             self.record_error(
@@ -958,12 +986,16 @@ impl Shared {
             }
             None => info.alloc,
         };
-        let identity = id_override.or_else(|| {
-            info.id.map(|id| NodeIdentity {
-                id,
-                link_like: false,
+        let identity = if collect_identity {
+            id_override.or_else(|| {
+                info.id.map(|id| NodeIdentity {
+                    id,
+                    link_like: false,
+                })
             })
-        });
+        } else {
+            None
+        };
         batch.push((
             Node::file(
                 name,
@@ -1000,9 +1032,11 @@ impl Shared {
             let mut t = lock(&self.tree);
             match self.push_locked(&mut t, parent, Node::dir(name, parent, depth, mtime)) {
                 Some(i) => {
-                    if let Some(identity) = identity {
-                        if identity.id.is_known() {
-                            t.set_id(i, identity.id, identity.link_like);
+                    if self.cfg.collect_identity() {
+                        if let Some(identity) = identity {
+                            if identity.id.is_known() {
+                                t.set_id(i, identity.id, identity.link_like);
+                            }
                         }
                     }
                     i
@@ -1081,6 +1115,7 @@ mod tests {
             want_identity: false,
             skip_pseudo: false,
             network: false,
+            root_is_network: false,
             local_only: false,
         }
     }
