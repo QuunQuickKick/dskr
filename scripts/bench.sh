@@ -75,7 +75,7 @@ tool_version() {
 }
 
 print_metadata() {
-    local cpu fs cache
+    local cpu fs cache mem storage threads empty
     cpu="unknown"
     if [ -r /proc/cpuinfo ]; then
         cpu=$(awk -F: '/model name/{gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)
@@ -83,6 +83,30 @@ print_metadata() {
         cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
     fi
     fs=$(df -h "$BASE" 2>/dev/null | tail -1 | tr -s ' ' || true)
+    mem="unknown"
+    if [ -r /proc/meminfo ]; then
+        mem=$(awk '/^MemTotal:/{printf "%.1fGiB", $2/1024/1024}' /proc/meminfo)
+    elif command -v sysctl >/dev/null 2>&1; then
+        local bytes
+        bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+        if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+            mem=$(awk -v b="$bytes" 'BEGIN { printf "%.1fGiB", b/1024/1024/1024 }')
+        fi
+    fi
+    storage="unknown"
+    if command -v lsblk >/dev/null 2>&1; then
+        local dev
+        dev=$(df -P "$BASE" 2>/dev/null | awk 'NR == 2 { print $1 }')
+        if [ -n "$dev" ]; then
+            storage=$(lsblk -dno MODEL "$dev" 2>/dev/null | head -1 | tr -s ' ' || true)
+        fi
+    fi
+    threads=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo unknown)
+    if [ "$FILE_SIZE" -eq 0 ]; then
+        empty=100
+    else
+        empty=0
+    fi
     if [ "$DROP_CACHES" = "1" ]; then
         cache="cold-attempt"
     else
@@ -92,12 +116,18 @@ print_metadata() {
     printf '# generated_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf '# os=%s\n' "$(uname -srm 2>/dev/null || echo unknown)"
     printf '# cpu=%s\n' "${cpu:-unknown}"
+    printf '# cpu_threads=%s\n' "${threads:-unknown}"
+    printf '# memory=%s\n' "${mem:-unknown}"
+    printf '# storage=%s\n' "${storage:-unknown}"
     printf '# fs=%s\n' "${fs:-unknown}"
     printf '# cache=%s\n' "$cache"
+    printf '# layout=flat-dirs depth=2 files_per_dir=%s empty_ratio=%s%% hardlinks=0\n' \
+        "$FILES_PER_DIR" "$empty"
     printf '# base=%s\n' "$BASE"
     printf '# sizes=%s\n' "$SIZES"
     printf '# files_per_dir=%s file_size=%s repeats=%s warmup=%s\n' \
         "$FILES_PER_DIR" "$FILE_SIZE" "$REPEATS" "$WARMUP"
+    printf '# dskr_format=json\n'
     printf '# dskr=%s\n' "$("$BIN" --version 2>/dev/null | head -1 || true)"
     printf '# commit=%s\n' "$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     for tool in $TOOLS; do
