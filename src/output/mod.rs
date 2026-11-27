@@ -1135,9 +1135,13 @@ mod tests {
         let mut csv = Vec::new();
         crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
         let s = String::from_utf8(csv).unwrap();
-        assert!(s.contains("\"/root/空 白,quote\"\"x\",true,"), "{s}");
+        let escaped = |path: &str| format!("\"{}\"", path.replace('"', "\"\""));
+        let sep = std::path::MAIN_SEPARATOR;
+        let dir_path = format!("/root{sep}空 白,quote\"x");
+        assert!(s.contains(&format!("{},true,", escaped(&dir_path))), "{s}");
+        let file_path = format!("{dir_path}{sep}a,b\"c");
         assert!(
-            s.contains("\"/root/空 白,quote\"\"x/a,b\"\"c\",false,"),
+            s.contains(&format!("{},false,", escaped(&file_path))),
             "{s}"
         );
     }

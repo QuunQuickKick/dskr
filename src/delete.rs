@@ -344,8 +344,11 @@ mod tests {
         symlink(&target, &victim).unwrap();
         let id = id_of(&victim);
 
+        // 置き換え用ファイルを先に作り、inode の再利用を避ける。
+        let replacement = dir.path().join("replacement.txt");
+        fs::write(&replacement, b"new").unwrap();
         fs::remove_file(&victim).unwrap();
-        fs::write(&victim, b"new").unwrap();
+        fs::rename(&replacement, &victim).unwrap();
 
         let err = remove_target(&victim, NodeKind::Other, id).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
