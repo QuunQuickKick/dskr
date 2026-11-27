@@ -127,7 +127,8 @@ directory = "vendor"
 ```
 
 > 実機での手動確認項目: UNC (`\\server\share`) の走査、長いパス (>260 文字)、ジャンクション、
-> OneDrive プレースホルダ、ファイルロック中、読み取り専用属性・ACL、Windows Terminal での Ctrl+C / `q` 後の端末復元。
+> OneDrive プレースホルダ、NTFS 圧縮 / スパース / ハードリンク、ファイルロック中、
+> 読み取り専用属性・ACL、Windows Terminal での Ctrl+C / `q` 後の端末復元。
 > 配布時はコード署名 (SmartScreen 警告の低減) も検討してください。
 
 ## 使い方

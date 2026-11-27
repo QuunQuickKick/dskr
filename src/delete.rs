@@ -412,6 +412,32 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn file_symlink_replacement_is_refused() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"old").unwrap();
+        let id = id_of(&victim);
+
+        let target = dir.path().join("target.txt");
+        fs::write(&target, b"keep").unwrap();
+        fs::remove_file(&victim).unwrap();
+        if symlink_file(&target, &victim).is_err() {
+            return; // 開発者モード / 権限がない環境ではスキップ
+        }
+
+        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
+        assert!(err.contains("置き換わっています"), "{err}");
+        assert!(target.exists());
+        assert!(fs::symlink_metadata(&victim)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn junction_delete_keeps_target() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
