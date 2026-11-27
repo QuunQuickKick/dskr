@@ -7,6 +7,20 @@ use std::path::{Path, PathBuf};
 use crate::scan::node::{FileId, NodeKind};
 use crate::scan::platform;
 
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FileDispositionInfo, GetFileInformationByHandle, GetVolumeInformationByHandleW,
+    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+
 /// Windows の長いパスでも削除できるように変換する。
 fn deletable_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -114,7 +128,8 @@ fn verify_target(
 
 /// 選択された項目を削除する。`kind` は走査時に記録した種別。
 ///
-/// - ファイル: ファイルを削除
+/// - Windows の通常ファイル: 同一ハンドルで検証して disposition を設定
+/// - ファイル (Windows 以外): ファイルを削除
 /// - フォルダ: 中身ごと削除
 /// - リンク / ジャンクション / 特殊ファイル: リンク先を辿らず実体だけ削除
 ///
@@ -128,11 +143,237 @@ pub fn remove_target(
     expected_link_like: bool,
 ) -> Result<(), String> {
     let (kind, md) = verify_target(path, kind, expected, expected_link_like)?;
+
+    // Phase 2-B: Windows の通常ファイルだけをハンドルベースで削除する。
+    // 対象外の種別は従来の削除経路を維持する。
+    #[cfg(windows)]
+    if kind == NodeKind::File && !expected_link_like {
+        return remove_file_by_handle(path, expected);
+    }
+
     let fs_path = deletable_path(path);
     match kind {
         NodeKind::Dir => fs::remove_dir_all(&fs_path).map_err(|e| format!("削除に失敗: {e}")),
         NodeKind::File => fs::remove_file(&fs_path).map_err(|e| format!("削除に失敗: {e}")),
         NodeKind::Other | NodeKind::Blocked => remove_link_or_leaf(&fs_path, &md),
+    }
+}
+
+/// ハンドルベース削除の対象検証。
+///
+/// 実際の削除を行う前に、同じハンドルから取得した情報だけを使って
+/// FileId・種別・属性・ハードリンク数・ファイルシステムを確認する。
+#[cfg(windows)]
+fn validate_handle_info(
+    info: &BY_HANDLE_FILE_INFORMATION,
+    expected: FileId,
+    fs_name: &str,
+) -> Result<(), String> {
+    if !expected.is_known() {
+        return Err(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
+                .into(),
+        );
+    }
+
+    let volume = info.dwVolumeSerialNumber as u64;
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    if volume != expected.volume || index != expected.index {
+        return Err("走査時から対象が置き換わっています (削除を中止しました)".into());
+    }
+
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err("対象がフォルダに変わっています (削除を中止しました)".into());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("対象がリンク / 再解析ポイントのため、削除を中止しました".into());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_READONLY != 0 {
+        return Err("読み取り専用ファイルは削除できません (属性は変更しません)".into());
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(format!(
+            "ハードリンク数が {} のため、削除を中止しました",
+            info.nNumberOfLinks
+        ));
+    }
+    if !fs_name.eq_ignore_ascii_case("NTFS") {
+        return Err(format!(
+            "NTFS以外のファイルシステムでは削除できません: {fs_name}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_error(code: u32) -> String {
+    std::io::Error::from_raw_os_error(code as i32).to_string()
+}
+
+#[cfg(windows)]
+fn to_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn last_error() -> u32 {
+    unsafe { GetLastError() }
+}
+
+/// ハンドルの閉鎖を 1 回だけ行うためのガード。
+/// 早期 return でもハンドルを解放し、明示 close 後は Drop で再試行しない。
+#[cfg(windows)]
+struct DeleteHandle(Option<HANDLE>);
+
+#[cfg(windows)]
+impl DeleteHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(Some(handle))
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0.expect("delete handle already closed")
+    }
+
+    fn close(&mut self) -> Result<(), u32> {
+        match self.0.take() {
+            Some(handle) => {
+                if unsafe { CloseHandle(handle) } == 0 {
+                    Err(last_error())
+                } else {
+                    Ok(())
+                }
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DeleteHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn volume_fs_name(handle: HANDLE) -> Result<String, String> {
+    let mut serial: u32 = 0;
+    let mut max_component: u32 = 0;
+    let mut fs_flags: u32 = 0;
+    let mut volume_name = [0u16; 64];
+    let mut fs_name = [0u16; 64];
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+            &mut serial,
+            &mut max_component,
+            &mut fs_flags,
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "ファイルシステムを確認できないため、削除を中止しました: {}",
+            windows_error(last_error())
+        ));
+    }
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
+    Ok(String::from_utf16_lossy(&fs_name[..len]))
+}
+
+#[cfg(windows)]
+fn set_delete_disposition(handle: HANDLE) -> Result<(), u32> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            &disposition as *const _ as *const c_void,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Windows ローカル NTFS の通常ファイルを、同一ハンドルで検証して削除する。
+///
+/// `CreateFileW` 失敗時も、検証失敗時も、path-based 削除へはフォールバックしない。
+#[cfg(windows)]
+fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), String> {
+    if !expected.is_known() {
+        return Err(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
+                .into(),
+        );
+    }
+
+    let fs_path = deletable_path(path);
+    let wide = to_wide(&fs_path);
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(format!(
+            "削除用ハンドルを取得できないため、削除を中止しました: {}",
+            windows_error(last_error())
+        ));
+    }
+    let mut handle = DeleteHandle::new(raw);
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.raw(), &mut info) } == 0 {
+        return Err(format!(
+            "削除対象のファイル情報を取得できないため、削除を中止しました: {}",
+            windows_error(last_error())
+        ));
+    }
+    let fs_name = volume_fs_name(handle.raw())?;
+    validate_handle_info(&info, expected, &fs_name)?;
+
+    if let Err(code) = set_delete_disposition(handle.raw()) {
+        let close = handle.close();
+        let mut message = format!("削除指示に失敗しました: {}", windows_error(code));
+        if let Err(close_code) = close {
+            message.push_str(&format!(
+                " / ハンドルの解放にも失敗しました: {}",
+                windows_error(close_code)
+            ));
+        }
+        return Err(message);
+    }
+
+    match handle.close() {
+        Ok(()) => Ok(()),
+        Err(code) => Err(format!(
+            "削除指示は成功しましたが、ハンドルの解放に失敗しました。ファイルの状態を確認できません: {}",
+            windows_error(code)
+        )),
     }
 }
 
@@ -440,9 +681,21 @@ mod tests {
         fs::hard_link(&victim, &twin).unwrap();
         let (id, link_like) = id_of(&victim);
 
-        remove_target(&victim, NodeKind::File, id, link_like).unwrap();
-        assert!(!victim.exists());
-        assert_eq!(fs::read(&twin).unwrap(), b"x");
+        #[cfg(windows)]
+        {
+            // Phase 2-B: Windows のハンドルベース削除はハードリンクを拒否する。
+            let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+            assert!(err.contains("ハードリンク"), "{err}");
+            assert!(victim.exists());
+            assert_eq!(fs::read(&victim).unwrap(), b"x");
+            assert_eq!(fs::read(&twin).unwrap(), b"x");
+        }
+        #[cfg(not(windows))]
+        {
+            remove_target(&victim, NodeKind::File, id, link_like).unwrap();
+            assert!(!victim.exists());
+            assert_eq!(fs::read(&twin).unwrap(), b"x");
+        }
     }
 
     #[cfg(windows)]
@@ -495,5 +748,193 @@ mod tests {
         remove_target(&link, NodeKind::Other, id, link_like).unwrap();
         assert!(!link.exists());
         assert!(target.join("keep.txt").exists());
+    }
+
+    #[cfg(windows)]
+    mod windows_handle_tests {
+        use super::*;
+
+        fn info_for(id: FileId) -> BY_HANDLE_FILE_INFORMATION {
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            info.dwVolumeSerialNumber = id.volume as u32;
+            info.nFileIndexHigh = (id.index >> 32) as u32;
+            info.nFileIndexLow = id.index as u32;
+            info.nNumberOfLinks = 1;
+            info
+        }
+
+        fn id() -> FileId {
+            FileId {
+                volume: 0x1234_5678,
+                index: 0x0000_0001_2345_6789,
+            }
+        }
+
+        #[test]
+        fn handle_validation_accepts_ntfs_regular_file() {
+            let info = info_for(id());
+            validate_handle_info(&info, id(), "NTFS").unwrap();
+        }
+
+        #[test]
+        fn handle_validation_rejects_id_mismatch() {
+            let info = info_for(id());
+            let other = FileId {
+                volume: id().volume,
+                index: id().index + 1,
+            };
+            assert!(validate_handle_info(&info, other, "NTFS").is_err());
+            let other_volume = FileId {
+                volume: id().volume + 1,
+                index: id().index,
+            };
+            assert!(validate_handle_info(&info, other_volume, "NTFS").is_err());
+        }
+
+        #[test]
+        fn handle_validation_rejects_unknown_expected_id() {
+            let info = info_for(id());
+            assert!(validate_handle_info(&info, FileId::UNKNOWN, "NTFS").is_err());
+        }
+
+        #[test]
+        fn handle_validation_rejects_directory_reparse_readonly_and_links() {
+            let mut info = info_for(id());
+            info.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+            assert!(validate_handle_info(&info, id(), "NTFS")
+                .unwrap_err()
+                .contains("フォルダ"));
+
+            info = info_for(id());
+            info.dwFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT;
+            assert!(validate_handle_info(&info, id(), "NTFS")
+                .unwrap_err()
+                .contains("リンク"));
+
+            info = info_for(id());
+            info.dwFileAttributes = FILE_ATTRIBUTE_READONLY;
+            assert!(validate_handle_info(&info, id(), "NTFS")
+                .unwrap_err()
+                .contains("読み取り専用"));
+
+            info = info_for(id());
+            info.nNumberOfLinks = 2;
+            assert!(validate_handle_info(&info, id(), "NTFS")
+                .unwrap_err()
+                .contains("ハードリンク"));
+        }
+
+        #[test]
+        fn handle_validation_rejects_non_ntfs() {
+            let info = info_for(id());
+            assert!(validate_handle_info(&info, id(), "FAT32")
+                .unwrap_err()
+                .contains("NTFS"));
+            assert!(validate_handle_info(&info, id(), "")
+                .unwrap_err()
+                .contains("NTFS"));
+        }
+
+        #[test]
+        fn removes_regular_file_by_handle() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("victim.txt");
+            fs::write(&file, b"x").unwrap();
+            let (id, link_like) = id_of(&file);
+
+            remove_target(&file, NodeKind::File, id, link_like).unwrap();
+            assert!(!file.exists());
+        }
+
+        #[test]
+        fn rejects_readonly_file_without_changing_attribute() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("readonly.txt");
+            fs::write(&file, b"x").unwrap();
+            let (id, link_like) = id_of(&file);
+
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&file, permissions).unwrap();
+
+            let err = remove_target(&file, NodeKind::File, id, link_like).unwrap_err();
+            assert!(err.contains("読み取り専用"), "{err}");
+            assert!(file.exists());
+            assert_eq!(fs::read(&file).unwrap(), b"x");
+            assert!(fs::metadata(&file).unwrap().permissions().readonly());
+
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&file, permissions).unwrap();
+        }
+
+        #[test]
+        fn disposition_failure_is_reported_and_file_remains() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("readonly-disposition.txt");
+            fs::write(&file, b"x").unwrap();
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&file, permissions).unwrap();
+
+            let handle = unsafe {
+                CreateFileW(
+                    to_wide(&file).as_ptr(),
+                    DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(handle != INVALID_HANDLE_VALUE && !handle.is_null());
+
+            let err = set_delete_disposition(handle).unwrap_err();
+            assert_eq!(err, 5, "read-only disposition should be ACCESS_DENIED");
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            assert!(file.exists());
+            assert_eq!(fs::read(&file).unwrap(), b"x");
+
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&file, permissions).unwrap();
+        }
+
+        #[test]
+        fn rejects_create_file_sharing_conflict_without_path_fallback() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("locked.txt");
+            fs::write(&file, b"x").unwrap();
+            let (id, link_like) = id_of(&file);
+
+            // Existing handle shares read/write but not delete.
+            let lock = unsafe {
+                CreateFileW(
+                    to_wide(&file).as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(lock != INVALID_HANDLE_VALUE && !lock.is_null());
+
+            let err = remove_target(&file, NodeKind::File, id, link_like).unwrap_err();
+            assert!(
+                err.contains("ハンドル") || err.contains("共有") || err.contains("sharing"),
+                "{err}"
+            );
+            assert!(file.exists());
+            assert_eq!(fs::read(&file).unwrap(), b"x");
+
+            unsafe {
+                let _ = CloseHandle(lock);
+            }
+        }
     }
 }

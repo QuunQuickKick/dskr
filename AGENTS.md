@@ -77,6 +77,8 @@ aarch64 + x86_64 の universal2 tar.gz を作る。Xcode Command Line Tools と
   ID を収集し、削除直前に再取得して照合する。リンク先は辿らない。
   ネットワークプロファイル、Windows のネットワークパス、Unix/macOS の
   ネットワークマウントと Unknown のファイルシステムでは収集しない。
+  Windows 11 ローカル NTFS の通常ファイルは同一ハンドルで ID・属性・
+  ハードリンク数・ファイルシステムを再検証してから disposition を設定する。
 
 ## テストの注意点
 

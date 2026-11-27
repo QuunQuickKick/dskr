@@ -250,6 +250,36 @@ TUI で `--allow-delete` を指定した場合、走査時に各ノードのフ�
 - ID を返さない特殊なファイルシステムでも `UNKNOWN` として扱い、削除を
   拒否します。
 
+### Windows 11 のハンドルベース削除
+
+Windows 11 のローカル NTFS 上の通常ファイルは、`CreateFileW` で削除用
+ハンドルを開き、同じハンドルで以下を検証してから
+`SetFileInformationByHandle(FileDispositionInfo)` を実行します。
+
+- 走査時の 64-bit FileId (volume serial + file index) と一致
+- ディレクトリ属性がない
+- 再解析ポイント属性がない
+- `FILE_ATTRIBUTE_READONLY` がない
+- `nNumberOfLinks == 1`
+- ファイルシステム名が `NTFS`
+
+ハンドルは次の条件で開きます。
+
+- `DELETE` のみ
+- `FILE_SHARE_READ | FILE_SHARE_WRITE`
+- `FILE_FLAG_OPEN_REPARSE_POINT`
+- `FILE_FLAG_BACKUP_SEMANTICS` なし
+- `FILE_FLAG_DELETE_ON_CLOSE` なし
+
+ハンドル取得、情報取得、検証、disposition のいずれかが失敗した場合は削除を
+拒否し、path-based 削除へフォールバックしません。disposition 成功後の
+`CloseHandle` 失敗は、削除指示成功・ハンドル解放状態不明として区別します。
+
+Windows 11 のこの経路は、ハードリンク、読み取り専用、リンク / 再解析ポイント、
+ディレクトリ、NTFS 以外を対象外とします。Windows 10、ReFS、FAT / exFAT、
+UNC / ネットワーク FS は未検証です。Windows のディレクトリ・リンクなど
+Phase 2-B の対象外は従来の path-based 経路を維持します。
+
 ### ディレクトリ削除の範囲
 
 フォルダ削除では、フォルダ自身の ID だけを検証します。中身は削除実行時点の
@@ -259,13 +289,17 @@ TUI で `--allow-delete` を指定した場合、走査時に各ノードのフ�
 ### 残存する TOCTOU リスク
 
 ファイル ID の検証と実際の削除は別の操作です。検証後、削除するまでの間に
-対象が置き換わる可能性は完全には排除できません。Unix には移植性のある
-「ID を比較してから同じ対象を原子的に unlink する」API がなく、Windows の
-再帰ディレクトリ削除もパスベースです。
+対象が置き換わる可能性は完全には排除できません。
 
-現時点では、検証直後に削除することで競合窓を最小化し、リンクを辿らない
-`remove_dir_all` と組み合わせてリスクを下げています。将来、Windows では
-`SetFileInformationByHandle` によるハンドル固定の削除を追加できる余地があります。
+Windows 11 のローカル NTFS 通常ファイルでは、`CreateFileW` で開いた同一
+ハンドルに対して ID 検証と `SetFileInformationByHandle` を行うため、開いた
+後のパス再解決による置き換えは防げます。ただし、走査時からハンドルを開く
+までの間に FileId が再利用された場合は、ID の一致だけでは検出できません。
+
+Unix には移植性のある「ID を比較してから同じ対象を原子的に unlink する」
+API がありません。Windows のディレクトリ・再帰削除・リンクなど Phase 2-B の
+対象外もパスベースです。これらは検証直後に削除することで競合窓を最小化し、
+リンクを辿らない `remove_dir_all` と組み合わせてリスクを下げています。
 
 また、OS が削除直後に同じ inode / file index を再利用した場合、ID の比較だけでは
 新しいファイルと元のファイルを区別できません。リンク種別やファイル種別が変わった
