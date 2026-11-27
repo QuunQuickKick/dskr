@@ -252,6 +252,8 @@ dskr /var --no-tui --json out.json --csv out.csv
 
 JSON はツリー全体を、CSV はフラットな行を出力します。JSON / CSV は制御文字や表計算の数式を無害化します。JSON の `incomplete` は取得できなかった項目があること、`errors_truncated` はエラー一覧が上限 (1000件) を超えて省略されていることを示します。`allocated_collected` が false のとき、`allocated` は実際の割当サイズではありません。`mtime` は取得できない場合 `null` です。`schema_version` は公開スキーマのバージョン、`blocked_folders` は対象外フォルダ数です。CSV の各行には、スキャン全体の状態として `cancelled` / `scan_truncated` / `scan_errors` / `allocated_collected` / `scan_blocked` / `schema_version` も入ります。
 
+JSON / CSV は preorder (親 → 子) で出力します。深い階層でも再帰せず、明示的なスタックで処理します。CSV の `path` はルートからのフルパスです。
+
 `-x` や `--local-only` で走査しないと決めたフォルダは、一覧では `(対象外)` と表示され、JSON の `"type"` は `"blocked"` になります (中身は集計されません)。
 
 ## 6. ネットワーク共有

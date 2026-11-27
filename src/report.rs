@@ -252,12 +252,13 @@ pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) ->
         "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected,scan_blocked,schema_version"
     )?;
     let tree = &outcome.tree;
-    let mut parts = vec![tree.node(tree.root).name.to_string_lossy().into_owned()];
+    // パスは 1 本のバッファを使い回す。行ごとの join / 再確保を避ける。
+    let mut path = tree.node(tree.root).name.to_string_lossy().into_owned();
     write_csv_row(
         w,
         tree,
         tree.root,
-        &parts,
+        &path,
         meta.cancelled,
         meta.truncated,
         meta.errors,
@@ -265,22 +266,25 @@ pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) ->
         blocked,
     )?;
 
-    // 再帰せず preorder で出力する。parts は現在のパスを表す。
-    let mut stack: Vec<(u32, usize)> = Vec::new();
+    // 再帰せず preorder で出力する。(node, 次の子, このノードに入る前のパス長)
+    let mut stack: Vec<(u32, usize, usize)> = Vec::new();
     if !tree.node(tree.root).children.is_empty() {
-        stack.push((tree.root, 0));
+        stack.push((tree.root, 0, 0));
     }
-    while let Some(&(idx, next)) = stack.last() {
+    while let Some(&(idx, next, parent_len)) = stack.last() {
         let children = &tree.node(idx).children;
         if next < children.len() {
             let child = children[next];
             stack.last_mut().expect("csv stack").1 += 1;
-            parts.push(tree.node(child).name.to_string_lossy().into_owned());
+            let name = tree.node(child).name.to_string_lossy();
+            let child_parent_len = path.len();
+            path.push(std::path::MAIN_SEPARATOR);
+            path.push_str(name.as_ref());
             write_csv_row(
                 w,
                 tree,
                 child,
-                &parts,
+                &path,
                 meta.cancelled,
                 meta.truncated,
                 meta.errors,
@@ -288,13 +292,13 @@ pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) ->
                 blocked,
             )?;
             if tree.node(child).children.is_empty() {
-                parts.pop();
+                path.truncate(child_parent_len);
             } else {
-                stack.push((child, 0));
+                stack.push((child, 0, child_parent_len));
             }
         } else {
             stack.pop();
-            parts.pop();
+            path.truncate(parent_len);
         }
     }
     Ok(())
@@ -305,7 +309,7 @@ fn write_csv_row(
     w: &mut dyn Write,
     t: &Tree,
     i: u32,
-    parts: &[String],
+    path: &str,
     cancelled: bool,
     scan_truncated: bool,
     scan_errors: u64,
@@ -313,12 +317,10 @@ fn write_csv_row(
     scan_blocked: u64,
 ) -> io::Result<()> {
     let n = &t.nodes[i as usize];
-    let sep = std::path::MAIN_SEPARATOR.to_string();
-    let p = parts.join(&sep);
     writeln!(
         w,
         "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        csv_field(&p),
+        csv_field(path),
         n.kind == NodeKind::Dir,
         n.total_alloc,
         n.total_logical,
