@@ -45,7 +45,8 @@ cargo build --release
 ```
 
 配布用のバイナリを作るときは、ビルド環境のローカルパスが混入しないよう
-`--remap-path-prefix` を付けます。Windows のビルドスクリプトは自動で設定します。
+`--remap-path-prefix` を付けます。Windows のビルドスクリプトと Linux の
+パッケージビルドスクリプトは自動で設定します。
 
 ```sh
 RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$PWD=/src" cargo build --release
@@ -98,24 +99,112 @@ dskr-<version>-windows-x86_64\
 
 `THIRD-PARTY-LICENSES.md` には依存クレートのライセンスと著作権表示を記載しています
 (`scripts/gen-licenses.sh` で生成。依存を更新したら再実行してコミットしてください)。
+Linux の静的 musl パッケージには、これに加えて musl libc と Rust 標準ライブラリの
+ライセンス通知 (`LICENSE-MUSL`、`LICENSE-RUST-MIT`、`LICENSE-RUST-APACHE`) を同梱します。
 
 `SHA256SUMS.txt` は `dskr.exe` のハッシュを `sha256sum` 互換の形式で記録します。
 `-Configuration Debug` では zip 名に `-debug` が付き、中の実行ファイルは `dskr-debug.exe` になります。
 
+### Linux でのパッケージビルド
+
+Linux 向けは静的 musl バイナリを 1 回ビルドし、tar.gz / .deb / .rpm を作成します。
+ダウンロード配布用で、ディストリビューションの公式リポジトリ向けではありません。
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install -y musl-tools rpm cpio
+bash scripts/build-linux.sh --all
+```
+
+| オプション | 意味 |
+|---|---|
+| `--tar` | tar.gz と `.sha256` を作成（指定なしの既定） |
+| `--deb` | `.deb` と `.sha256` を作成 |
+| `--rpm` | `.rpm` と `.sha256` を作成 |
+| `--all` | tar.gz / .deb / .rpm をすべて作成 |
+| `--test` | ビルド前にホストで `cargo test --release` |
+| `--clean` | 事前に `cargo clean` |
+| `--no-smoke` | 起動確認を省略 |
+| `--out-dir <path>` | 出力先（既定: `dist`） |
+| `--target <triple>` | ターゲット（既定: `x86_64-unknown-linux-musl`） |
+
+出力:
+
+```text
+dist/dskr-<version>-linux-x86_64.tar.gz
+dist/dskr-<version>-linux-x86_64.tar.gz.sha256
+dist/dskr_<version>-1_amd64.deb
+dist/dskr_<version>-1_amd64.deb.sha256
+dist/dskr-<version>-1.x86_64.rpm
+dist/dskr-<version>-1.x86_64.rpm.sha256
+```
+
+tar.gz の中身:
+
+```text
+dskr-<version>-linux-x86_64/
+├── dskr
+├── README.md
+├── USAGE.md
+├── ACCURACY.md
+├── LICENSE
+├── LICENSE-MUSL
+├── LICENSE-RUST-MIT
+├── LICENSE-RUST-APACHE
+├── THIRD-PARTY-LICENSES.md
+└── SHA256SUMS.txt
+```
+
+.deb は `/usr/bin/dskr` と `/usr/share/doc/dskr/`、.rpm は `/usr/bin/dskr`、
+`/usr/share/doc/dskr/`、`/usr/share/licenses/dskr/` に配置します。
+
+```sh
+sudo apt install ./dskr_0.4.0-1_amd64.deb
+sudo dnf install ./dskr-0.4.0-1.x86_64.rpm
+```
+
+静的 musl のため glibc のバージョンに依存しません。musl libc と Rust 標準
+ライブラリのライセンス通知を同梱しています。パッケージは未署名なので、
+添付の SHA-256 を確認してから導入してください。
+
+Linux パッケージの検証:
+
+```sh
+bash scripts/verify-linux-packages.sh dist
+```
+
 ### GitHub Releases での配布
 
-`v0.1.1` のようなタグを push すると、GitHub Actions が自動で上記と同じ内容の
-zip をビルドし、GitHub Releases に公開します (ワークフロー: `.github/workflows/release-windows.yml`)。
+`vX.Y.Z` のようなタグを push すると、GitHub Actions が Linux の tar.gz / .deb / .rpm
+と Windows の zip を作成し、**両方が成功した場合だけ** GitHub Releases に公開します
+(ワークフロー: `.github/workflows/release.yml`)。
 
 ```sh
 git push origin main
-git tag v0.1.1        # Cargo.toml の version と一致させること
-git push origin v0.1.1
+git tag vX.Y.Z        # Cargo.toml の version と一致させること
+git push origin vX.Y.Z
+```
+
+出力される成果物:
+
+```text
+dskr-<version>-linux-x86_64.tar.gz
+dskr-<version>-linux-x86_64.tar.gz.sha256
+dskr_<version>-1_amd64.deb
+dskr_<version>-1_amd64.deb.sha256
+dskr-<version>-1.x86_64.rpm
+dskr-<version>-1.x86_64.rpm.sha256
+dskr-<version>-windows-x86_64.zip
+dskr-<version>-windows-x86_64.zip.sha256
 ```
 
 タグ名と `Cargo.toml` の `version` が一致しない場合は失敗します。
+再実行時は既存 Release に成果物を追加し直します。
 
-スクリプトはビルド後に `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行い、SHA-256 とサイズを表示します。
+Linux のビルドスクリプトはビルド後に `dskr --version` と
+`dskr . --no-tui --max-depth 1 --top 5` で起動確認を行います。
+Windows のスクリプトは `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行い、
+SHA-256 とサイズを表示します。
 オフライン環境では、ネットワークのある環境で先に `cargo vendor vendor` を実行し、`.cargo\config.toml` に以下を追加してからフォルダごとコピーしてください。
 
 ```toml

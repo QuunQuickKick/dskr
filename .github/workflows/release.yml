@@ -1,8 +1,8 @@
-name: Release (Windows)
+name: Release
 
-# v0.1.1 のようなタグを push すると、scripts/build-windows.ps1 -Zip で
-# 配布用 zip をビルドし、GitHub Release に添付して公開する。
-# テスト (cargo test) は ci.yml が 3 OS で実施するため、ここでは省略する。
+# vX.Y.Z タグを push すると、Linux (tar.gz / .deb / .rpm) と
+# Windows (zip) を作成し、両方が成功した場合だけ GitHub Release に添付します。
+# テスト (cargo test) は ci.yml が 3 OS で実施するため、ここでは省略します。
 
 on:
   push:
@@ -13,6 +13,45 @@ permissions:
   contents: write
 
 jobs:
+  linux-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: rustup target add x86_64-unknown-linux-musl
+
+      - name: パッケージ作成ツールを導入
+        run: sudo apt-get update && sudo apt-get install -y musl-tools rpm cpio
+
+      - name: タグと Cargo.toml のバージョン整合チェック
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ "$tag" != "$version" ]; then
+            echo "タグ ($tag) と Cargo.toml のバージョン ($version) が一致しません" >&2
+            exit 1
+          fi
+          echo "バージョン整合 OK: $GITHUB_REF_NAME"
+
+      - name: 第三者ライセンス一覧の生成
+        run: |
+          bash scripts/gen-licenses.sh
+          git diff --exit-code THIRD-PARTY-LICENSES.md
+
+      - name: Linux パッケージを作成
+        run: bash scripts/build-linux.sh --all
+
+      - name: Linux パッケージを検証
+        run: bash scripts/verify-linux-packages.sh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dskr-linux
+          path: dist/*
+
   windows-zip:
     runs-on: windows-latest
     steps:
@@ -61,7 +100,7 @@ jobs:
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($expected -ne $actual) { throw 'zip の SHA-256 が一致しません' }
 
-          # zip 直下はバージョン付きフォルダ 1 つで、同梱物は 5 ファイル
+          # zip 直下はバージョン付きフォルダ 1 つで、同梱物は 7 ファイル
           $dest = Join-Path $env:RUNNER_TEMP 'release-zip-check'
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath $dest
@@ -77,11 +116,30 @@ jobs:
           }
           Write-Host "検証 OK: $zip"
 
-      - name: GitHub Release を作成して zip を添付
-        shell: pwsh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dskr-windows
+          path: dist/*
+
+  publish:
+    needs: [linux-packages, windows-zip]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: GitHub Release を作成して成果物を添付
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          gh release create "$env:GITHUB_REF_NAME" --title "$env:GITHUB_REF_NAME" --generate-notes "dist/*.zip" "dist/*.zip.sha256"
-          Write-Host "リリースを作成しました: https://github.com/$($env:GITHUB_REPOSITORY)/releases/tag/$($env:GITHUB_REF_NAME)"
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            echo "既存リリースに成果物を追加しました: $tag"
+          else
+            gh release create "$tag" --title "$tag" --generate-notes dist/*
+            echo "リリースを作成しました: $tag"
+          fi

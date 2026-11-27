@@ -1,0 +1,31 @@
+dskr の Linux パッケージに同梱されるソフトウェアの著作権・ライセンス表示。
+
+dskr
+----
+Copyright (c) 2026 QQK
+
+dskr 本体は MIT License で提供されます。全文は同梱の LICENSE を参照してください。
+
+musl libc
+---------
+Copyright (c) 2005-2020 Rich Felker, et al.
+
+Linux 用の dskr は musl libc を静的リンクしています。musl は主に MIT
+License で提供され、一部のファイルに BSD 系などの追加条項があります。
+全文と追加条項は同梱の LICENSE-MUSL を参照してください。
+
+Rust 標準ライブラリ
+-------------------
+Copyright (c) The Rust Project Contributors
+
+Rust 標準ライブラリは MIT License または Apache License 2.0 の
+デュアルライセンスです。全文は同梱の LICENSE-RUST-MIT と
+LICENSE-RUST-APACHE を参照してください。
+
+第三者クレート
+--------------
+dskr が利用する Cargo クレートのライセンスと著作権表示は
+THIRD-PARTY-LICENSES.md にまとめています。
+
+このパッケージはディストリビューションの公式リポジトリ向けではなく、
+プロジェクトが配布するダウンロード用パッケージです。

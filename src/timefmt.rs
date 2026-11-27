@@ -23,6 +23,9 @@ pub fn utc_datetime(secs: i64) -> String {
 
 #[cfg(unix)]
 fn local_parts(secs: i64) -> Option<(i64, u32, u32, u32, u32)> {
+    // musl ターゲットでは libc::time_t の型エイリアスに deprecated が付くが、
+    // localtime_r の ABI に合わせるため型として必要。
+    #[allow(deprecated)]
     let t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::localtime_r(&t, &mut tm) };

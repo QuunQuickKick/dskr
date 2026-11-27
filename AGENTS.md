@@ -25,6 +25,12 @@ Windows 向けパッケージング: `scripts/build-windows.ps1` (`build-windows
 コミットされている必要がある。出力先 `dist/` は `target/` と同様に gitignore
 対象。
 
+Linux 向けパッケージング: `scripts/build-linux.sh --all` で静的 musl の
+tar.gz / .deb / .rpm を作る。`rustup target add x86_64-unknown-linux-musl` と
+`musl-tools` / `rpm` / `cpio` が必要。検証は
+`scripts/verify-linux-packages.sh dist`。ダウンロード配布用で、公式
+ディストリビューションリポジトリ向けではない。
+
 ## 守るべき制約
 
 - **ネットワークコードとネットワーク系クレートを追加しない。** CI は

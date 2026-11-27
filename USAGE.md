@@ -468,6 +468,31 @@ dskr /data --allow-delete
 | `--pause-on-start` | 無効 |
 | `--allow-delete` | 無効 |
 
+## 12. Linux パッケージの導入
+
+配布用の Linux パッケージは静的 musl バイナリです。glibc のバージョンに依存しません。
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./dskr_0.4.0-1_amd64.deb
+
+# RHEL / Fedora / openSUSE
+sudo dnf install ./dskr-0.4.0-1.x86_64.rpm
+```
+
+tar.gz を使う場合:
+
+```sh
+tar -xzf dskr-0.4.0-linux-x86_64.tar.gz
+cd dskr-0.4.0-linux-x86_64
+./dskr --version
+```
+
+パッケージは未署名です。ダウンロードしたファイルの SHA-256 を確認してから
+導入してください。ライセンスは各パッケージの `LICENSE`、`LICENSE-MUSL`、
+`LICENSE-RUST-MIT`、`LICENSE-RUST-APACHE`、`THIRD-PARTY-LICENSES.md` に
+含まれます。公式リポジトリ向けではなく、プロジェクトのダウンロード配布用です。
+
 ## 関連ドキュメント
 
 - [README.md](README.md): 概要、ビルド方法、開発者向け情報

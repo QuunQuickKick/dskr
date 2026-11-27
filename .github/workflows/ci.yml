@@ -57,6 +57,27 @@ jobs:
       - run: cargo build --release --locked
       - run: cargo test --locked
 
+  linux-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: パッケージ作成ツールを導入
+        run: sudo apt-get update && sudo apt-get install -y musl-tools rpm cpio
+      - name: Third-party licenses 一覧が最新であること
+        run: |
+          bash scripts/gen-licenses.sh
+          git diff --exit-code THIRD-PARTY-LICENSES.md
+      - name: Linux パッケージを作成
+        run: bash scripts/build-linux.sh --all
+      - name: Linux パッケージを検証
+        run: bash scripts/verify-linux-packages.sh dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dskr-linux
+          path: dist/*
+
   windows-unc-error-handling:
     runs-on: windows-latest
     steps:
