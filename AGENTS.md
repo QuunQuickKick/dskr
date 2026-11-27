@@ -17,7 +17,8 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 CI は `fmt` → `clippy` を実行し (どちらも失敗でブロック)、Ubuntu / macOS /
-Windows でテストする。README にある `cargo check --target ...` は CI では
+Windows でテストする。Linux / macOS / Windows のパッケージ生成と検証も
+CI で実行する。README にある `cargo check --target ...` は CI では
 実行されない。
 
 Windows 向けパッケージング: `scripts/build-windows.ps1` (`build-windows.cmd`

@@ -415,6 +415,7 @@ OS ごとの対応状況や詳しい制限は [USAGE.md](USAGE.md) のマトリ�
 | `-o, --output FILE\|-` | 出力先 (省略時は標準出力) |
 | `-d, --depth N` | tree / markdown / html の深さ |
 | `-t, --top N` | 表示する件数 (report/tree/flat/markdown/html。0 で無制限) |
+| `-n, --no-tui` | 画面なしで出力 (既定: 概要レポート) |
 | `-s, --sort size\|name\|count\|mtime[:asc\|desc]` | 並び順 (既定 size:desc) |
 | `-u, --units iec\|si` | 1024 基準 / 1000 基準 |
 | `-U, --unit auto\|b\|kib\|mib\|gib\|tib\|pib\|eib` | 表示単位 |
@@ -526,7 +527,7 @@ CSV: `path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,c
 
 条件: Linux WSL2 / Intel Core i5-11400H / `/dev/sdd` / warm cache /
 3 回の中央値 / 1 ディレクトリあたり 100 または 1,000 ファイル /
-深さ 2 / ハードリンクなし。dskr は `0.4.0` (`c6a2853`)、
+深さ 2 / ハードリンクなし。測定時点の dskr は `0.4.0` (`c6a2853`)、
 gdu `5.25.0`、dua `3.0.3`、ncdu `1.22`、du (GNU coreutils) `9.7`。
 
 | データ | ツール | wall (ms) | 最大 RSS (MiB) | CPU (s) |
@@ -637,18 +638,20 @@ strace -f -e trace=%network ./target/release/dskr /path --no-tui
 objdump -T target/release/dskr | grep -E '(^|[[:space:]])(connect|getaddrinfo|sendto|bind|listen|accept|socket)$'
 ```
 
-CI (GitHub Actions) は Linux / macOS / Windows のマトリクスでテストし、MSRV 1.85 のジョブも実行します。Windows ランナーでは `\\localhost\C$` を使った UNC スモークテストを任意ジョブとして実行し、存在しない共有のエラーハンドリングは必須ジョブとして検証します。
+CI (GitHub Actions) は Linux / macOS / Windows のマトリクスでテストし、MSRV 1.85 のジョブも実行します。Linux の tar.gz / .deb / .rpm、macOS の universal2、Windows の zip も CI で作成・検証します。Windows ランナーでは `\\localhost\C$` を使った UNC スモークテストを任意ジョブとして実行し、存在しない共有のエラーハンドリングは必須ジョブとして検証します。
 
 構成:
 
 ```
 src/
 ├── main.rs          # エントリ、CLI と TUI/ヘッドレスの振り分け
+├── lib.rs           # 統合テスト用の公開モジュール
 ├── cli.rs           # clap による引数定義
 ├── delete.rs        # 削除前のファイル ID 検証 (リンク先は辿らない)
 ├── path.rs          # パス種別判定 (UNC)、glob、表示短縮
 ├── format.rs        # サイズ単位 (IEC/SI・自動/固定)・件数の表記
 ├── sort.rs          # ソート種類/方向の共通ロジック
+├── timefmt.rs       # 更新日時のローカル時刻表示
 ├── scan/
 │   ├── engine.rs    # 並列走査、負荷制御 (一時停止/レート制限/優先度)
 │   ├── node.rs      # アリーナ型ツリーと集計

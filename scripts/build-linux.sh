@@ -35,7 +35,7 @@ usage() {
 
 必要なツール:
   rustup target add x86_64-unknown-linux-musl
-  sudo apt-get install -y musl-tools rpm   # .rpm を作る場合
+  sudo apt-get install -y musl-tools rpm cpio   # .rpm を作る場合
 EOF
 }
 
