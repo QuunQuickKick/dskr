@@ -753,6 +753,7 @@ mod tests {
     #[cfg(windows)]
     mod windows_handle_tests {
         use super::*;
+        use windows_sys::Win32::Foundation::GENERIC_READ;
 
         fn info_for(id: FileId) -> BY_HANDLE_FILE_INFORMATION {
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -910,11 +911,11 @@ mod tests {
             fs::write(&file, b"x").unwrap();
             let (id, link_like) = id_of(&file);
 
-            // Existing handle shares read/write but not delete.
+            // Existing handle requests read access and shares read/write but not delete.
             let lock = unsafe {
                 CreateFileW(
                     to_wide(&file).as_ptr(),
-                    0,
+                    GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     std::ptr::null(),
                     OPEN_EXISTING,
