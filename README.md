@@ -127,7 +127,7 @@ directory = "vendor"
 ```
 
 > 実機での手動確認項目: UNC (`\\server\share`) の走査、長いパス (>260 文字)、ジャンクション、
-> OneDrive プレースホルダ、Windows Terminal での Ctrl+C / `q` 後の端末復元。
+> OneDrive プレースホルダ、ファイルロック中、読み取り専用属性・ACL、Windows Terminal での Ctrl+C / `q` 後の端末復元。
 > 配布時はコード署名 (SmartScreen 警告の低減) も検討してください。
 
 ## 使い方
@@ -328,7 +328,7 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 ```json
 {
   "schema_version": 1,
-  "dskr_version": "0.3.0",
+  "dskr_version": "0.4.0",
   "generated_at": "2026-11-25T00:30:04.357Z",
   "root": "\\\\fileserver\\share",
   "root_kind": "unc",
@@ -383,6 +383,9 @@ BENCH_SIZES="1000000" BENCH_FILES_PER_DIR=1000 scripts/bench.sh
 # 100ms 後に SIGINT を送り、中止までの応答時間も測る
 BENCH_SIZES="1000000" BENCH_CANCEL_AFTER_MS=100 scripts/bench.sh
 
+# gdu / dua / ncdu も比較する (事前に各自インストールしたものだけを使う)
+BENCH_TOOLS="gdu dua ncdu" scripts/bench.sh
+
 # フィクスチャを消す / コールドキャッシュで測る
 BENCH_KEEP=0 scripts/bench.sh
 sudo env BENCH_DROP_CACHES=1 scripts/bench.sh
@@ -402,8 +405,14 @@ sudo env BENCH_DROP_CACHES=1 scripts/bench.sh
 | `BENCH_DROP_CACHES` | `0` | Linux でページキャッシュを落とす (root) |
 | `BENCH_DU` | `1` | `du -s` も計測する |
 | `BENCH_CANCEL_AFTER_MS` | `0` | 指定ミリ秒後に SIGINT を送り、中止応答を測る |
+| `BENCH_TOOLS` | 空 | 比較する外部ツール (`gdu dua ncdu`) |
+| `BENCH_GDU_CMD` | `gdu -n` | gdu のコマンド |
+| `BENCH_DUA_CMD` | `dua aggregate` | dua のコマンド |
+| `BENCH_NCDU_CMD` | `ncdu -o` | ncdu の非対話コマンド |
 
-出力は TSV です。Linux では `/proc` から RSS と I/O を取得し、macOS では `ps` から RSS/CPU を取得します (I/O は未対応)。Windows は WSL など bash が動く環境で実行してください。`-cancel` 行の `wall_ms` は、SIGINT を送ってから終了するまでの時間です。
+出力は TSV です。先頭に `#` コメントで OS・CPU・ファイルシステム・キャッシュ状態・dskr のバージョンとコミットを記録します。Linux では `/proc` から RSS と I/O を取得し、macOS では `ps` から RSS/CPU を取得します (I/O は未対応)。Windows は WSL など bash が動く環境で実行してください。`-cancel` 行の `wall_ms` は、SIGINT を送ってから終了するまでの時間です。
+
+gdu / dua / ncdu は同梱せず、自動インストールもしません。利用者が導入した実行ファイルだけを任意で呼び出し、未導入ならスキップします。結果は同一条件での参考値として扱い、ツール間の優劣を断定しないでください。
 
 結果は環境依存です。比較するときは、同じハードウェア・同じファイル構成・同じキャッシュ状態で測ってください。
 
