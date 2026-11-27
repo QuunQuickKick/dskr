@@ -150,7 +150,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: dskr-windows
-          path: dist/*
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
 
   publish:
     needs: [linux-packages, macos-packages, windows-zip]
