@@ -320,7 +320,7 @@ not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 
-## 依存クレート (93 件)
+## 依存クレート (99 件)
 
 | クレート | バージョン | ライセンス | 著作権者 | リポジトリ |
 |---|---|---|---|---|
@@ -368,6 +368,7 @@ authorization of the copyright holder.
 |lock_api|0.4.14|MIT OR Apache-2.0|Amanieu d'Antras &lt;amanieu@gmail.com&gt;|https://github.com/Amanieu/parking_lot|
 |log|0.4.35|MIT OR Apache-2.0|The Rust Project Developers|https://github.com/rust-lang/log|
 |lru|0.12.5|MIT|Jerome Froelich &lt;jeromefroelic@hotmail.com&gt;|https://github.com/jeromefroe/lru-rs.git|
+|memchr|2.8.3|Unlicense OR MIT|Andrew Gallant &lt;jamslam@gmail.com&gt;;bluss|https://github.com/BurntSushi/memchr|
 |mio|1.2.5|MIT|Carl Lerche &lt;me@carllerche.com&gt;;Thomas de Zeeuw &lt;thomasdezeeuw@gmail.com&gt;;Tokio Contributors &lt;team@tokio.rs&gt;|https://github.com/tokio-rs/mio|
 |once_cell|1.21.4|MIT OR Apache-2.0|Aleksey Kladov &lt;aleksey.kladov@gmail.com&gt;|https://github.com/matklad/once_cell|
 |once_cell_polyfill|1.70.2|MIT OR Apache-2.0|-|https://github.com/polyfill-rs/once_cell_polyfill|
@@ -384,6 +385,10 @@ authorization of the copyright holder.
 |rustversion|1.0.23|MIT OR Apache-2.0|David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/dtolnay/rustversion|
 |ryu|1.0.23|Apache-2.0 OR BSL-1.0|David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/dtolnay/ryu|
 |scopeguard|1.2.0|MIT OR Apache-2.0|bluss|https://github.com/bluss/scopeguard|
+|serde|1.0.229|MIT OR Apache-2.0|Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;;David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/serde-rs/serde|
+|serde_core|1.0.229|MIT OR Apache-2.0|Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;;David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/serde-rs/serde|
+|serde_derive|1.0.229|MIT OR Apache-2.0|Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;;David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/serde-rs/serde|
+|serde_json|1.0.154|MIT OR Apache-2.0|-|https://github.com/serde-rs/json|
 |signal-hook|0.3.18|Apache-2.0/MIT|Michal 'vorner' Vaner &lt;vorner@vorner.cz&gt;;Thomas Himmelstoss &lt;thimm@posteo.de&gt;|https://github.com/vorner/signal-hook|
 |signal-hook-mio|0.2.5|MIT OR Apache-2.0|Michal 'vorner' Vaner &lt;vorner@vorner.cz&gt;;Thomas Himmelstoss &lt;thimm@posteo.de&gt;|https://github.com/vorner/signal-hook|
 |signal-hook-registry|1.4.8|MIT OR Apache-2.0|Michal 'vorner' Vaner &lt;vorner@vorner.cz&gt;;Masaki Hara &lt;ackie.h.gmai@gmail.com&gt;|https://github.com/vorner/signal-hook|
@@ -417,3 +422,4 @@ authorization of the copyright holder.
 |windows_x86_64_gnu|0.52.6|MIT OR Apache-2.0|Microsoft|https://github.com/microsoft/windows-rs|
 |windows_x86_64_gnullvm|0.52.6|MIT OR Apache-2.0|Microsoft|https://github.com/microsoft/windows-rs|
 |windows_x86_64_msvc|0.52.6|MIT OR Apache-2.0|Microsoft|https://github.com/microsoft/windows-rs|
+|zmij|1.0.23|MIT|David Tolnay &lt;dtolnay@gmail.com&gt;|https://github.com/dtolnay/zmij|

@@ -588,6 +588,140 @@ mod tests {
         }
     }
 
+    fn deep_outcome(depth: u16) -> ScanOutcome {
+        let mut tree = Tree::with_root("/root".into(), 0);
+        let mut cur = 0;
+        for i in 0..depth {
+            cur = tree
+                .push_child_capped(
+                    cur,
+                    Node::dir(format!("d{i}").into(), cur, i + 1, 0),
+                    u64::from(depth) + 10,
+                )
+                .unwrap();
+        }
+        tree.push_child_capped(
+            cur,
+            Node::file("leaf".into(), cur, depth + 1, 1, 1, 0),
+            u64::from(depth) + 10,
+        )
+        .unwrap();
+        tree.aggregate();
+        ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: u64::from(depth) + 1,
+            dirs: u64::from(depth),
+            error_count: 0,
+            bytes_alloc: 1,
+            bytes_logical: 1,
+            elapsed: Duration::from_millis(1),
+            root: PathBuf::from("/root"),
+        }
+    }
+
+    fn deep_leaf_path(depth: u16) -> String {
+        let mut path = String::from("/root");
+        for i in 0..depth {
+            path.push(std::path::MAIN_SEPARATOR);
+            path.push_str(&format!("d{i}"));
+        }
+        path.push(std::path::MAIN_SEPARATOR);
+        path.push_str("leaf");
+        path
+    }
+
+    fn preorder_names(tree: &Tree) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root];
+        while let Some(idx) = stack.pop() {
+            let n = tree.node(idx);
+            out.push(n.name.to_string_lossy().into_owned());
+            for &child in n.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    fn json_names(value: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(root) = value.get("tree") else {
+            panic!("JSON tree がない");
+        };
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            out.push(
+                node.get("name")
+                    .and_then(|v| v.as_str())
+                    .expect("JSON name")
+                    .to_string(),
+            );
+            if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+                for child in children.iter().rev() {
+                    stack.push(child);
+                }
+            }
+        }
+        out
+    }
+
+    fn parse_json_names_in_large_stack(bytes: &[u8]) -> Vec<String> {
+        let bytes = bytes.to_vec();
+        std::thread::Builder::new()
+            .name("dskr-json-parse".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                use serde::Deserialize;
+                let mut de = serde_json::Deserializer::from_slice(&bytes);
+                de.disable_recursion_limit();
+                let value = serde_json::Value::deserialize(&mut de).expect("JSON を再読込できる");
+                de.end().expect("末尾に余分なデータがない");
+                // 64MiB スタック上で Value を破棄する (深い入れ子の drop 対策)。
+                json_names(&value)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    struct CountingWriter {
+        lines: usize,
+        current: Vec<u8>,
+        last: Vec<u8>,
+    }
+
+    impl CountingWriter {
+        fn new() -> Self {
+            Self {
+                lines: 0,
+                current: Vec::new(),
+                last: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            for &b in buf {
+                if b == b'\n' {
+                    self.lines += 1;
+                    self.last = std::mem::take(&mut self.current);
+                } else {
+                    self.current.push(b);
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn format_defaults_are_consistent() {
         assert_eq!(OutputFormat::Markdown.default_depth(), 2);
@@ -856,58 +990,156 @@ mod tests {
     }
 
     #[test]
-    fn deep_tree_json_and_csv_do_not_recurse() {
-        let (_unused, meta) = fixture();
-        let deep_outcome = |depth: u16| {
-            let mut tree = Tree::with_root("/root".into(), 0);
-            let mut cur = 0;
-            for i in 0..depth {
-                cur = tree
-                    .push_child_capped(
-                        cur,
-                        Node::dir(format!("d{i}").into(), cur, i + 1, 0),
-                        u64::from(depth) + 10,
-                    )
-                    .unwrap();
-            }
-            tree.push_child_capped(
-                cur,
-                Node::file("leaf".into(), cur, depth + 1, 1, 1, 0),
-                u64::from(depth) + 10,
-            )
-            .unwrap();
-            tree.aggregate();
-            ScanOutcome {
-                tree,
-                errors: Vec::new(),
-                hardlink_groups: Default::default(),
-                truncated: false,
-                cancelled: false,
-                entries: u64::from(depth) + 1,
-                dirs: u64::from(depth),
-                error_count: 0,
-                bytes_alloc: 1,
-                bytes_logical: 1,
-                elapsed: Duration::from_millis(1),
-                root: PathBuf::from("/root"),
-            }
-        };
-
-        // JSON は深いツリーでも出力できる。
+    fn deep_json_is_reparseable_and_keeps_order() {
+        let (_, meta) = fixture();
         let outcome = deep_outcome(10_000);
         let mut json = Vec::new();
         crate::report::write_json(&mut json, &outcome, &meta).unwrap();
-        let s = String::from_utf8(json).unwrap();
-        assert!(s.starts_with('{'));
-        assert!(s.ends_with("}\n"));
-        assert_eq!(s.matches("\"name\":").count(), 10_002);
+        assert!(json.ends_with(b"}\n"));
 
-        // CSV も深いツリーで行数が維持される。
-        let outcome = deep_outcome(2_000);
+        let expected = preorder_names(&outcome.tree);
+        let actual = parse_json_names_in_large_stack(&json);
+        assert_eq!(actual.len(), 10_002);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.last().map(String::as_str), Some("leaf"));
+    }
+
+    #[test]
+    fn deep_csv_keeps_paths_and_order() {
+        let (_, meta) = fixture();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let depth = 2_000;
+        let outcome = deep_outcome(depth);
         let mut csv = Vec::new();
         crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
         let s = String::from_utf8(csv).unwrap();
-        assert_eq!(s.lines().count(), 2_003); // header + root + dirs + leaf
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), usize::from(depth) + 3); // header + root + dirs + leaf
+        assert!(lines[0].starts_with("path,"));
+        assert!(lines[1].starts_with("/root,true,"), "{}", lines[1]);
+        assert!(
+            lines[2].starts_with(&format!("/root{sep}d0,true,")),
+            "{}",
+            lines[2]
+        );
+        let leaf = deep_leaf_path(depth);
+        assert!(
+            lines.last().unwrap().starts_with(&leaf),
+            "{}",
+            lines.last().unwrap()
+        );
+
+        // 10,000 階層は出力が巨大になるため、破棄 Writer で行数と最深行だけ確認する。
+        let outcome = deep_outcome(10_000);
+        let mut sink = CountingWriter::new();
+        crate::report::write_csv(&mut sink, &outcome, &meta).unwrap();
+        assert_eq!(sink.lines, 10_003);
+        let last = String::from_utf8(sink.last).unwrap();
+        assert!(last.starts_with(&deep_leaf_path(10_000)), "{last}");
+    }
+
+    #[test]
+    fn deep_tree_with_many_siblings_is_preorder_in_json_and_csv() {
+        let (_, meta) = fixture();
+        let depth = 1_000u16;
+        let siblings = 5u16;
+        let mut tree = Tree::with_root("/root".into(), 0);
+        let mut cur = 0;
+        for i in 0..depth {
+            cur = tree
+                .push_child_capped(
+                    cur,
+                    Node::dir(format!("d{i}").into(), cur, i + 1, 0),
+                    u64::from(depth) * u64::from(siblings + 2),
+                )
+                .unwrap();
+            for j in 0..siblings {
+                tree.push_child_capped(
+                    cur,
+                    Node::file(format!("s{i}-{j}").into(), cur, i + 1, 1, 1, 0),
+                    u64::from(depth) * u64::from(siblings + 2),
+                )
+                .unwrap();
+            }
+        }
+        tree.push_child_capped(
+            cur,
+            Node::file("leaf".into(), cur, depth + 1, 1, 1, 0),
+            u64::from(depth) * u64::from(siblings + 2),
+        )
+        .unwrap();
+        tree.aggregate();
+        let outcome = ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: u64::from(depth) * u64::from(siblings + 1) + 1,
+            dirs: u64::from(depth),
+            error_count: 0,
+            bytes_alloc: 1,
+            bytes_logical: 1,
+            elapsed: Duration::from_millis(1),
+            root: PathBuf::from("/root"),
+        };
+
+        let expected = preorder_names(&outcome.tree);
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        assert_eq!(parse_json_names_in_large_stack(&json), expected);
+
+        let mut csv = Vec::new();
+        crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
+        let s = String::from_utf8(csv).unwrap();
+        assert_eq!(s.lines().count(), expected.len() + 1);
+    }
+
+    #[test]
+    fn json_and_csv_escape_unicode_and_special_names() {
+        let (_, meta) = fixture();
+        let mut tree = Tree::with_root("/root".into(), 0);
+        let dir = tree
+            .push_child_capped(0, Node::dir("空 白,quote\"x".into(), 0, 1, 0), 100)
+            .unwrap();
+        tree.push_child_capped(dir, Node::file("a,b\"c".into(), dir, 2, 1, 1, 0), 100)
+            .unwrap();
+        tree.aggregate();
+        let outcome = ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: 3,
+            dirs: 1,
+            error_count: 0,
+            bytes_alloc: 1,
+            bytes_logical: 1,
+            elapsed: Duration::from_millis(1),
+            root: PathBuf::from("/root"),
+        };
+
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        assert_eq!(
+            parse_json_names_in_large_stack(&json),
+            vec![
+                "/root".to_string(),
+                "空 白,quote\"x".to_string(),
+                "a,b\"c".to_string()
+            ]
+        );
+
+        let mut csv = Vec::new();
+        crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
+        let s = String::from_utf8(csv).unwrap();
+        assert!(s.contains("\"/root/空 白,quote\"\"x\",true,"), "{s}");
+        assert!(
+            s.contains("\"/root/空 白,quote\"\"x/a,b\"\"c\",false,"),
+            "{s}"
+        );
     }
 
     fn output_for_test(
