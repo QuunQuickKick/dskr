@@ -493,6 +493,21 @@ cd dskr-0.4.0-linux-x86_64
 `LICENSE-RUST-MIT`、`LICENSE-RUST-APACHE`、`THIRD-PARTY-LICENSES.md` に
 含まれます。公式リポジトリ向けではなく、プロジェクトのダウンロード配布用です。
 
+## 13. macOS パッケージの導入
+
+macOS は Apple Silicon と Intel の両方を含む universal2 の tar.gz です。
+
+```sh
+tar -xzf dskr-0.4.0-macos-universal2.tar.gz
+cd dskr-0.4.0-macos-universal2
+xattr -d com.apple.quarantine ./dskr   # ブラウザで取得した場合
+./dskr --version
+```
+
+`xattr` は Gatekeeper の quarantine 属性を外すためのものです。パッケージは
+Apple の公証 (notarization) を受けていません。ライセンスは `LICENSE`、
+`LICENSE-RUST-MIT`、`LICENSE-RUST-APACHE`、`THIRD-PARTY-LICENSES.md` に含まれます。
+
 ## 関連ドキュメント
 
 - [README.md](README.md): 概要、ビルド方法、開発者向け情報

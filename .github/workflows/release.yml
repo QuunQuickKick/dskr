@@ -52,6 +52,37 @@ jobs:
           name: dskr-linux
           path: dist/*
 
+  macos-packages:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: タグと Cargo.toml のバージョン整合チェック
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ "$tag" != "$version" ]; then
+            echo "タグ ($tag) と Cargo.toml のバージョン ($version) が一致しません" >&2
+            exit 1
+          fi
+          echo "バージョン整合 OK: $GITHUB_REF_NAME"
+
+      - name: macOS パッケージを作成
+        run: bash scripts/build-macos.sh --universal
+
+      - name: macOS パッケージを検証
+        run: bash scripts/verify-macos-packages.sh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dskr-macos
+          path: dist/*
+
   windows-zip:
     runs-on: windows-latest
     steps:
@@ -100,7 +131,7 @@ jobs:
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($expected -ne $actual) { throw 'zip の SHA-256 が一致しません' }
 
-          # zip 直下はバージョン付きフォルダ 1 つで、同梱物は 7 ファイル
+          # zip 直下はバージョン付きフォルダ 1 つで、同梱物は 9 ファイル
           $dest = Join-Path $env:RUNNER_TEMP 'release-zip-check'
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath $dest
@@ -108,7 +139,7 @@ jobs:
           if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) {
             throw 'zip 直下はパッケージフォルダ 1 つである必要があります'
           }
-          $expectedFiles = @('dskr.exe', 'README.md', 'USAGE.md', 'ACCURACY.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md', 'SHA256SUMS.txt') | Sort-Object
+          $expectedFiles = @('dskr.exe', 'README.md', 'USAGE.md', 'ACCURACY.md', 'LICENSE', 'LICENSE-RUST-MIT', 'LICENSE-RUST-APACHE', 'THIRD-PARTY-LICENSES.md', 'SHA256SUMS.txt') | Sort-Object
           $actualFiles = @(Get-ChildItem $top[0].FullName | Select-Object -ExpandProperty Name) | Sort-Object
           $diff = Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles
           if ($diff) {
@@ -122,7 +153,7 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [linux-packages, windows-zip]
+    needs: [linux-packages, macos-packages, windows-zip]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

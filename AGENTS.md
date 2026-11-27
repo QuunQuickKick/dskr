@@ -31,6 +31,11 @@ tar.gz / .deb / .rpm を作る。`rustup target add x86_64-unknown-linux-musl` �
 `scripts/verify-linux-packages.sh dist`。ダウンロード配布用で、公式
 ディストリビューションリポジトリ向けではない。
 
+macOS 向けパッケージング: `scripts/build-macos.sh --universal` で
+aarch64 + x86_64 の universal2 tar.gz を作る。Xcode Command Line Tools と
+`rustup target add aarch64-apple-darwin x86_64-apple-darwin` が必要。
+検証は `scripts/verify-macos-packages.sh dist`。署名・公証は行わない。
+
 ## 守るべき制約
 
 - **ネットワークコードとネットワーク系クレートを追加しない。** CI は

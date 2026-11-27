@@ -363,7 +363,7 @@ Rust (cargo) が見つかりません。次のいずれかで導入してくだ�
     if ($Zip) {
         Write-Step 'zip を作成しています'
         $packageName = "dskr-" + $version + "-" + $suffix
-        $documents = @('README.md', 'USAGE.md', 'ACCURACY.md', 'LICENSE', 'THIRD-PARTY-LICENSES.md')
+        $documents = @('README.md', 'USAGE.md', 'ACCURACY.md', 'LICENSE', 'LICENSE-RUST-MIT', 'LICENSE-RUST-APACHE', 'THIRD-PARTY-LICENSES.md')
 
         # 同梱物が欠けたまま配布しないよう、先に存在確認する。
         $missing = @()

@@ -45,8 +45,8 @@ cargo build --release
 ```
 
 配布用のバイナリを作るときは、ビルド環境のローカルパスが混入しないよう
-`--remap-path-prefix` を付けます。Windows のビルドスクリプトと Linux の
-パッケージビルドスクリプトは自動で設定します。
+`--remap-path-prefix` を付けます。Windows / Linux / macOS のパッケージ
+ビルドスクリプトは自動で設定します。
 
 ```sh
 RUSTFLAGS="--remap-path-prefix=$HOME=/build --remap-path-prefix=$PWD=/src" cargo build --release
@@ -68,7 +68,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -T
 | オプション | 意味 |
 |---|---|
 | `-Test` | ビルド前に `cargo test --release` を実行 |
-| `-Zip` | `dskr.exe` + README + USAGE + ACCURACY + LICENSE + ハッシュを同梱した zip を `dist\` に作成 |
+| `-Zip` | `dskr.exe` + README + USAGE + ACCURACY + LICENSE + Rust ライセンス + ハッシュを同梱した zip を `dist\` に作成 |
 | `-Clean` | 事前に `cargo clean` |
 | `-NoSmoke` | 生成した exe の起動確認を省略 |
 | `-Offline` | `vendor/` を使ったオフラインビルド |
@@ -93,14 +93,17 @@ dskr-<version>-windows-x86_64\
 ├── USAGE.md
 ├── ACCURACY.md
 ├── LICENSE
+├── LICENSE-RUST-MIT
+├── LICENSE-RUST-APACHE
 ├── THIRD-PARTY-LICENSES.md
 └── SHA256SUMS.txt
 ```
 
 `THIRD-PARTY-LICENSES.md` には依存クレートのライセンスと著作権表示を記載しています
 (`scripts/gen-licenses.sh` で生成。依存を更新したら再実行してコミットしてください)。
-Linux の静的 musl パッケージには、これに加えて musl libc と Rust 標準ライブラリの
-ライセンス通知 (`LICENSE-MUSL`、`LICENSE-RUST-MIT`、`LICENSE-RUST-APACHE`) を同梱します。
+Linux の静的 musl パッケージには musl libc と Rust 標準ライブラリのライセンス通知
+(`LICENSE-MUSL`、`LICENSE-RUST-MIT`、`LICENSE-RUST-APACHE`) を同梱します。
+macOS と Windows のパッケージには Rust 標準ライブラリのライセンス通知を同梱します。
 
 `SHA256SUMS.txt` は `dskr.exe` のハッシュを `sha256sum` 互換の形式で記録します。
 `-Configuration Debug` では zip 名に `-debug` が付き、中の実行ファイルは `dskr-debug.exe` になります。
@@ -173,11 +176,70 @@ Linux パッケージの検証:
 bash scripts/verify-linux-packages.sh dist
 ```
 
+### macOS でのパッケージビルド
+
+macOS では Apple Silicon と Intel を 1 つにまとめた universal2 の tar.gz を
+作成します。Xcode Command Line Tools が必要です。ダウンロード配布用で、
+App Store / 公証 (notarization) は行いません。
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+bash scripts/build-macos.sh --universal
+```
+
+| オプション | 意味 |
+|---|---|
+| `--universal` | aarch64 + x86_64 の universal2（既定） |
+| `--arch aarch64\|x86_64` | 単一アーキテクチャ |
+| `--test` | ビルド前に macOS 上で `cargo test --release` |
+| `--clean` | 事前に `cargo clean` |
+| `--no-smoke` | 起動確認を省略 |
+| `--out-dir <path>` | 出力先（既定: `dist`） |
+
+出力:
+
+```text
+dist/dskr-<version>-macos-universal2.tar.gz
+dist/dskr-<version>-macos-universal2.tar.gz.sha256
+```
+
+tar.gz の中身:
+
+```text
+dskr-<version>-macos-universal2/
+├── dskr
+├── README.md
+├── USAGE.md
+├── ACCURACY.md
+├── LICENSE
+├── LICENSE-RUST-MIT
+├── LICENSE-RUST-APACHE
+├── THIRD-PARTY-LICENSES.md
+└── SHA256SUMS.txt
+```
+
+`MACOSX_DEPLOYMENT_TARGET` の既定は `11.0` です。`lipo` で universal2 を作成し、
+ad-hoc 署名を付け直します。これは Apple Silicon で実行するためのもので、
+Gatekeeper の公証ではありません。
+
+ブラウザからダウンロードした場合、quarantine 属性で起動を止められることがあります。
+
+```sh
+xattr -d com.apple.quarantine ./dskr
+./dskr --version
+```
+
+macOS パッケージの検証:
+
+```sh
+bash scripts/verify-macos-packages.sh dist
+```
+
 ### GitHub Releases での配布
 
-`vX.Y.Z` のようなタグを push すると、GitHub Actions が Linux の tar.gz / .deb / .rpm
-と Windows の zip を作成し、**両方が成功した場合だけ** GitHub Releases に公開します
-(ワークフロー: `.github/workflows/release.yml`)。
+`vX.Y.Z` のようなタグを push すると、GitHub Actions が Linux の tar.gz / .deb / .rpm、
+macOS の universal2 tar.gz、Windows の zip を作成し、**すべて成功した場合だけ**
+GitHub Releases に公開します (ワークフロー: `.github/workflows/release.yml`)。
 
 ```sh
 git push origin main
@@ -194,6 +256,8 @@ dskr_<version>-1_amd64.deb
 dskr_<version>-1_amd64.deb.sha256
 dskr-<version>-1.x86_64.rpm
 dskr-<version>-1.x86_64.rpm.sha256
+dskr-<version>-macos-universal2.tar.gz
+dskr-<version>-macos-universal2.tar.gz.sha256
 dskr-<version>-windows-x86_64.zip
 dskr-<version>-windows-x86_64.zip.sha256
 ```
@@ -203,6 +267,7 @@ dskr-<version>-windows-x86_64.zip.sha256
 
 Linux のビルドスクリプトはビルド後に `dskr --version` と
 `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行います。
+macOS のビルドスクリプトは universal2 の `lipo -archs` と起動確認を行います。
 Windows のスクリプトは `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行い、
 SHA-256 とサイズを表示します。
 オフライン環境では、ネットワークのある環境で先に `cargo vendor vendor` を実行し、`.cargo\config.toml` に以下を追加してからフォルダごとコピーしてください。
