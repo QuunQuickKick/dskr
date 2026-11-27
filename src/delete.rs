@@ -134,21 +134,40 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn readonly_file_delete_fails_without_changing_attributes() {
+    fn locked_file_delete_fails() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        };
+
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("readonly.txt");
+        let file = dir.path().join("locked.txt");
         fs::write(&file, b"x").unwrap();
-        let mut perms = fs::metadata(&file).unwrap().permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&file, perms).unwrap();
+        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                0, // 共有なし: このテストの間は削除できない
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            println!("(スキップ: ファイルをロックできません)");
+            return;
+        }
 
         let err = remove_target(&file, NodeKind::File).unwrap_err();
         assert!(!err.is_empty());
         assert!(file.exists());
 
-        let mut perms = fs::metadata(&file).unwrap().permissions();
-        perms.set_readonly(false);
-        fs::set_permissions(&file, perms).unwrap();
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
     }
 
     #[cfg(unix)]
