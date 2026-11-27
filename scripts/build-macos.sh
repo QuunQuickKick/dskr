@@ -153,8 +153,9 @@ for doc in "${DOCS[@]}"; do
     [ -f "$ROOT_DIR/$doc" ] || fail "同梱するファイルが見つかりません: $doc"
 done
 
-mkdir -p "$OUT_DIR" "$BIN_DIR"
+mkdir -p "$OUT_DIR"
 rm -rf "$STAGE_ROOT" "$BIN_DIR"
+mkdir -p "$BIN_DIR"
 
 if [ "$DO_CLEAN" -eq 1 ]; then
     echo "==> cargo clean"
