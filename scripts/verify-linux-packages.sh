@@ -5,6 +5,10 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 DIST=${1:-"$ROOT_DIR/dist"}
+DIST=$(cd "$DIST" && pwd) || {
+    echo "エラー: 出力先が見つかりません: $DIST" >&2
+    exit 1
+}
 
 fail() {
     echo "エラー: $*" >&2
