@@ -1,6 +1,8 @@
 //! 並列スキャンエンジン。カスタムワーカープールにより、一時停止・キャンセル、
 //! レート制限 (エントリ/stat 処理数ベース) を確実に制御する。
 
+#[cfg(unix)]
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
@@ -147,6 +149,18 @@ impl Progress {
     }
 }
 
+/// テスト用のファイルシステム判定モック。
+///
+/// 実際の NFS/SMB マウントを CI で用意できないため、パスごとの
+/// ボリュームIDと分類を差し替える。
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FsMock {
+    pub volume: fn(&Path) -> Option<u64>,
+    pub info: fn(&Path) -> platform::FsInfo,
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub root: PathBuf,
@@ -175,6 +189,10 @@ pub struct EngineConfig {
     pub root_is_network: bool,
     /// --local-only: ネットワークFSへの走査を一切行わない。
     pub local_only: bool,
+    /// テスト用のファイルシステム判定モック。
+    #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fs_mock: Option<FsMock>,
 }
 
 impl EngineConfig {
@@ -230,11 +248,21 @@ struct NodeIdentity {
     link_like: bool,
 }
 
+/// ディレクトリ配下で削除用 ID を収集してよいかのスコープ。
+#[derive(Clone, Copy)]
+struct IdentityScope {
+    allowed: bool,
+    /// Unix の st_dev。マウントポイントの一意な識別子ではなく、
+    /// ファイルシステム分類キャッシュのキーとしてのみ使う。
+    volume: Option<u64>,
+}
+
 enum Msg {
     Dir {
         path: PathBuf,
         node: u32,
         depth: u16,
+        identity: IdentityScope,
     },
     Stop,
 }
@@ -257,9 +285,10 @@ struct Shared {
     #[cfg_attr(not(windows), allow(dead_code))]
     root_drive: Option<u8>,
     truncated: AtomicBool,
-    /// ボリュームID → ネットワークFSか (--local-only 時のみ使用)
+    /// st_dev → ファイルシステム分類。
+    /// `--local-only` と削除用 ID 収集で共有する。
     #[cfg_attr(windows, allow(dead_code))]
-    netfs_cache: Mutex<HashMap<u64, bool>>,
+    fs_class_cache: Mutex<HashMap<u64, platform::FsInfo>>,
 }
 
 /// 200ms 窓のトークンバケット。rate=0 は無制限。
@@ -356,14 +385,7 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
     let root_mtime = root_md.as_ref().map(platform::mtime_secs).unwrap_or(0);
     let root_volume = platform::volume_of(&fs_root);
 
-    let mut initial_tree = Tree::with_root(cfg.root.as_os_str().to_owned(), root_mtime);
-    if cfg.collect_identity() {
-        if let Some(md) = &root_md {
-            if let Some(id) = platform::file_id(md, &fs_root, false) {
-                initial_tree.set_id(0, id, false);
-            }
-        }
-    }
+    let initial_tree = Tree::with_root(cfg.root.as_os_str().to_owned(), root_mtime);
     let tree_arc = Arc::new(Mutex::new(initial_tree));
     let root = lock(&tree_arc).root;
 
@@ -392,9 +414,18 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         root_volume,
         root_drive: root_drive_of(&fs_root),
         truncated: AtomicBool::new(false),
-        netfs_cache: Mutex::new(HashMap::new()),
+        fs_class_cache: Mutex::new(HashMap::new()),
         cfg,
     });
+
+    let root_identity = shared.root_identity_scope(&fs_root, root_md.as_ref());
+    if root_identity.allowed {
+        if let Some(md) = &root_md {
+            if let Some(id) = platform::file_id(md, &fs_root, false) {
+                lock(&shared.tree).set_id(root, id, false);
+            }
+        }
+    }
 
     if shared.root_volume.is_none() && (shared.cfg.one_file_system || shared.cfg.local_only) {
         shared.record_error(
@@ -433,6 +464,7 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
             path: fs_root.clone(),
             node: root,
             depth: 0,
+            identity: root_identity,
         });
 
         // 完了 or キャンセル待ち
@@ -548,7 +580,12 @@ fn worker(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<Msg>) {
         }
         match rx.recv() {
             Ok(Msg::Stop) | Err(_) => break,
-            Ok(Msg::Dir { path, node, depth }) => {
+            Ok(Msg::Dir {
+                path,
+                node,
+                depth,
+                identity,
+            }) => {
                 if sh.control.state() == ControlState::Cancelling {
                     sh.pending.fetch_sub(1, Ordering::Release);
                     break;
@@ -556,7 +593,7 @@ fn worker(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<Msg>) {
                 // パニックしても pending を取りこぼさず、ワーカーも継続する
                 let guard = PendingGuard(&sh);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    process_dir(&sh, path, node, depth)
+                    process_dir(&sh, path, node, depth, identity)
                 }));
                 drop(guard);
                 if result.is_err() {
@@ -588,7 +625,13 @@ fn is_excluded(excludes: &[String], name: &OsString) -> bool {
     excludes.iter().any(|pat| path::glob_match(pat, &s))
 }
 
-fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
+fn process_dir(
+    sh: &Arc<Shared>,
+    path: PathBuf,
+    node: u32,
+    depth: u16,
+    parent_identity: IdentityScope,
+) {
     {
         let mut cur = lock(&sh.progress.current);
         *cur = path.to_string_lossy().into_owned();
@@ -680,13 +723,16 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
             if sh.cfg.skip_pseudo && path::is_pseudo_path(&child_path) {
                 continue;
             }
-            let volume = if sh.wants_volume(false) {
-                platform::volume_of(&child_path)
-            } else {
-                None
-            };
+            let child_identity = sh.identity_scope(&child_path, &md, parent_identity);
+            let volume = child_identity.volume.or_else(|| {
+                if sh.wants_volume(false) {
+                    platform::volume_of(&child_path)
+                } else {
+                    None
+                }
+            });
             if !sh.dir_allowed(&child_path, volume, false) {
-                let id = sh.identity(&md, &child_path, false);
+                let id = sh.identity(&md, &child_path, false, child_identity.allowed);
                 batch.push((
                     Node::blocked(name, node, depth + 1, platform::mtime_secs(&md)),
                     None,
@@ -695,7 +741,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 continue;
             }
             if sh.cfg.follow_links && !sh.mark_visited(&md, &child_path) {
-                let id = sh.identity(&md, &child_path, false);
+                let id = sh.identity(&md, &child_path, false, child_identity.allowed);
                 batch.push((
                     Node::other(
                         name,
@@ -710,7 +756,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 ));
                 continue;
             }
-            let id = sh.identity(&md, &child_path, false);
+            let id = sh.identity(&md, &child_path, false, child_identity.allowed);
             if !sh.queue_dir(
                 node,
                 name,
@@ -718,6 +764,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 depth + 1,
                 platform::mtime_secs(&md),
                 id,
+                child_identity,
             ) {
                 break; // ノード上限、またはワーカー停止
             }
@@ -725,13 +772,29 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
         }
 
         if ft.is_file() {
-            sh.add_file(&mut batch, name, node, depth + 1, &md, &child_path, None);
+            let child_identity = sh.identity_scope(&child_path, &md, parent_identity);
+            sh.add_file(
+                &mut batch,
+                name,
+                node,
+                depth + 1,
+                &md,
+                &child_path,
+                None,
+                child_identity.allowed,
+            );
             continue;
         }
 
         // シンボリックリンク / 再解析ポイント (ジャンクション等) / 特殊ファイル
         // 既定では辿らない。辿るのは --follow-links 指定時のみ。
-        let leaf_id = sh.identity(&md, &child_path, ft.is_symlink() || is_reparse);
+        // リンク自体は、リンクが存在する親ディレクトリのスコープで判定する。
+        let leaf_id = sh.identity(
+            &md,
+            &child_path,
+            ft.is_symlink() || is_reparse,
+            parent_identity.allowed,
+        );
         let leaf = || {
             (
                 Node::other(
@@ -779,7 +842,10 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                         batch.push(leaf());
                         continue;
                     }
-                    let link_id = sh.identity(&md, &child_path, true);
+                    // リンク先は独立したファイルシステムとして分類する。
+                    // リンク元の親ディレクトリの分類を継承しない。
+                    let target_identity = sh.identity_scope(&child_path, &tmd, parent_identity);
+                    let link_id = sh.identity(&md, &child_path, true, parent_identity.allowed);
                     if !sh.queue_dir(
                         node,
                         name,
@@ -787,6 +853,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                         depth + 1,
                         platform::mtime_secs(&tmd),
                         link_id,
+                        target_identity,
                     ) {
                         break;
                     }
@@ -795,7 +862,8 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                     // リンク先がファイルの場合も直接走査と同じフィルタ
                     // (min_size / クラウドプレースホルダ) を適用する。
                     // サイズはリンク先、削除時の ID はリンク自身を使う。
-                    let link_id = sh.identity(&md, &child_path, true);
+                    let target_identity = sh.identity_scope(&child_path, &tmd, parent_identity);
+                    let link_id = sh.identity(&md, &child_path, true, parent_identity.allowed);
                     sh.add_file(
                         &mut batch,
                         name,
@@ -804,6 +872,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                         &tmd,
                         &child_path,
                         link_id,
+                        target_identity.allowed,
                     );
                 }
                 Err(e) => {
@@ -846,12 +915,126 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
     }
 }
 
+/// 分類結果をキャッシュへ first-wins で格納する。
+///
+/// 同じ st_dev に対して複数ワーカーが同時に分類しても、先に格納された
+/// `FsInfo` (class と local_only_network の組) を以後の全員が使う。
+#[cfg(unix)]
+fn store_fs_info(
+    cache: &Mutex<HashMap<u64, platform::FsInfo>>,
+    volume: u64,
+    info: platform::FsInfo,
+) -> platform::FsInfo {
+    let mut cache = lock(cache);
+    match cache.entry(volume) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => {
+            entry.insert(info);
+            info
+        }
+    }
+}
+
 impl Shared {
     /// ボリュームIDの取得が必要か (余計な stat を避ける)
     fn wants_volume(&self, is_link: bool) -> bool {
         self.cfg.one_file_system
             || self.cfg.local_only
             || (is_link && (self.cfg.network || cfg!(windows)))
+    }
+
+    /// メタデータから得たボリュームID。テストではモックで差し替える。
+    #[cfg(unix)]
+    fn fs_volume(&self, path: &Path, md: &Metadata) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(mock) = self.cfg.fs_mock {
+            return (mock.volume)(path);
+        }
+        let _ = path;
+        platform::metadata_volume(md)
+    }
+
+    /// ボリューム単位でファイルシステム分類をキャッシュする。
+    ///
+    /// st_dev はマウントポイントの一意な識別子ではないが、同じ st_dev は
+    /// 同じファイルシステム実体を指すため、bind mount を含めて分類を共有できる。
+    #[cfg(unix)]
+    fn fs_info(&self, path: &Path, volume: Option<u64>) -> platform::FsInfo {
+        if let Some(vol) = volume {
+            if let Some(info) = lock(&self.fs_class_cache).get(&vol).copied() {
+                return info;
+            }
+        }
+        // 分類はロック外で行う。結果の格納は first-wins。
+        let info = self.classify_fs_path(path);
+        if let Some(vol) = volume {
+            store_fs_info(&self.fs_class_cache, vol, info)
+        } else {
+            info
+        }
+    }
+
+    #[cfg(unix)]
+    fn classify_fs_path(&self, path: &Path) -> platform::FsInfo {
+        #[cfg(test)]
+        if let Some(mock) = self.cfg.fs_mock {
+            return (mock.info)(path);
+        }
+        platform::classify_fs(path)
+    }
+
+    /// 子ノードの ID 収集スコープを決める。
+    ///
+    /// - 同じ st_dev なら親の許可状態を継承
+    /// - 異なる st_dev なら分類し、Local のときだけ許可
+    /// - 親が不許可なら分類せず不許可を継承
+    #[cfg(unix)]
+    fn identity_scope(&self, path: &Path, md: &Metadata, parent: IdentityScope) -> IdentityScope {
+        let volume = self.fs_volume(path, md);
+        if !self.cfg.collect_identity() || !parent.allowed {
+            return IdentityScope {
+                allowed: false,
+                volume,
+            };
+        }
+        let allowed = match (parent.volume, volume) {
+            (Some(a), Some(b)) if a == b => true,
+            _ => self.fs_info(path, volume).class == platform::FsClass::Local,
+        };
+        IdentityScope { allowed, volume }
+    }
+
+    #[cfg(not(unix))]
+    fn identity_scope(&self, _path: &Path, _md: &Metadata, parent: IdentityScope) -> IdentityScope {
+        IdentityScope {
+            allowed: parent.allowed && self.cfg.collect_identity(),
+            volume: None,
+        }
+    }
+
+    /// ルートのスコープ。ルートの分類に失敗した場合は安全側で不許可。
+    #[cfg(unix)]
+    fn root_identity_scope(&self, path: &Path, md: Option<&Metadata>) -> IdentityScope {
+        let volume = md.and_then(|m| self.fs_volume(path, m));
+        if !self.cfg.collect_identity() || md.is_none() {
+            return IdentityScope {
+                allowed: false,
+                volume,
+            };
+        }
+        let info = self.fs_info(path, volume);
+        IdentityScope {
+            allowed: info.class == platform::FsClass::Local,
+            volume,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn root_identity_scope(&self, _path: &Path, _md: Option<&Metadata>) -> IdentityScope {
+        IdentityScope {
+            allowed: self.cfg.collect_identity(),
+            volume: None,
+        }
     }
 
     /// このディレクトリへ入ってよいか。
@@ -869,22 +1052,9 @@ impl Shared {
             }
             #[cfg(not(windows))]
             {
-                let net = match volume {
-                    Some(vol) => {
-                        let cached = lock(&self.netfs_cache).get(&vol).copied();
-                        match cached {
-                            Some(v) => v,
-                            None => {
-                                let n = platform::is_network_fs(child);
-                                lock(&self.netfs_cache).insert(vol, n);
-                                n
-                            }
-                        }
-                    }
-                    // ボリュームIDが不明な場合はキャッシュせず都度判定する。
-                    None => platform::is_network_fs(child),
-                };
-                if net {
+                // 既存の --local-only 挙動を維持するため、ID 分類とは別の
+                // local_only_network を使う。
+                if self.fs_info(child, volume).local_only_network {
                     return false;
                 }
             }
@@ -925,9 +1095,15 @@ impl Shared {
         !(self.cfg.network && cfg!(windows))
     }
 
-    /// 削除時の同一性検証用 ID。要求されていない場合は None。
-    fn identity(&self, md: &Metadata, path: &Path, link_like: bool) -> Option<NodeIdentity> {
-        if !self.cfg.collect_identity() {
+    /// 削除時の同一性検証用 ID。要求されていない、またはスコープ外なら None。
+    fn identity(
+        &self,
+        md: &Metadata,
+        path: &Path,
+        link_like: bool,
+        allowed: bool,
+    ) -> Option<NodeIdentity> {
+        if !self.cfg.collect_identity() || !allowed {
             return None;
         }
         platform::file_id(md, path, link_like).map(|id| NodeIdentity { id, link_like })
@@ -946,6 +1122,7 @@ impl Shared {
         md: &Metadata,
         path: &Path,
         id_override: Option<NodeIdentity>,
+        identity_allowed: bool,
     ) -> bool {
         let logical = md.len();
         if logical < self.cfg.min_size {
@@ -959,13 +1136,15 @@ impl Shared {
         // そうしないと TUI の「ディスク使用量」切替や JSON の allocated が
         // 見かけのサイズになってしまう。ネットワークでは余計な往復を避ける。
         let collect_alloc = self.cfg.want_allocated || (cfg!(windows) && !self.cfg.network);
-        let collect_identity = self.cfg.collect_identity();
+        // リンク自身の ID (id_override) は親スコープで決まるが、リンク先の
+        // ファイル ID はリンク先のスコープでのみ収集する。
+        let collect_own_identity = self.cfg.collect_identity() && identity_allowed;
         let info = platform::file_size_info(
             md,
             path,
             collect_alloc,
             self.want_hardlink(),
-            collect_identity,
+            collect_own_identity,
         );
         if collect_alloc && !info.alloc_exact {
             self.record_error(
@@ -986,12 +1165,16 @@ impl Shared {
             }
             None => info.alloc,
         };
-        let identity = if collect_identity {
+        let identity = if self.cfg.collect_identity() {
             id_override.or_else(|| {
-                info.id.map(|id| NodeIdentity {
-                    id,
-                    link_like: false,
-                })
+                if collect_own_identity {
+                    info.id.map(|id| NodeIdentity {
+                        id,
+                        link_like: false,
+                    })
+                } else {
+                    None
+                }
             })
         } else {
             None
@@ -1019,6 +1202,7 @@ impl Shared {
 
     /// ディレクトリノードを登録して走査タスクを投入する。
     /// ノード上限に達した、またはワーカーが停止した場合は false。
+    #[allow(clippy::too_many_arguments)]
     fn queue_dir(
         &self,
         parent: u32,
@@ -1027,11 +1211,15 @@ impl Shared {
         depth: u16,
         mtime: i64,
         identity: Option<NodeIdentity>,
+        scope: IdentityScope,
     ) -> bool {
         let idx = {
             let mut t = lock(&self.tree);
             match self.push_locked(&mut t, parent, Node::dir(name, parent, depth, mtime)) {
                 Some(i) => {
+                    // identity はリンク自身のスコープで既に判定済み。
+                    // リンク先のスコープ (scope) が不許可でも、ローカル上の
+                    // リンク自身の ID は保持できる。
                     if self.cfg.collect_identity() {
                         if let Some(identity) = identity {
                             if identity.id.is_known() {
@@ -1051,6 +1239,7 @@ impl Shared {
                 path,
                 node: idx,
                 depth,
+                identity: scope,
             })
             .is_err()
         {
@@ -1096,6 +1285,8 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::scan::node::NodeKind;
     use tempfile::tempdir;
 
     fn cfg(root: &Path) -> EngineConfig {
@@ -1117,6 +1308,7 @@ mod tests {
             network: false,
             root_is_network: false,
             local_only: false,
+            fs_mock: None,
         }
     }
 
@@ -1127,6 +1319,198 @@ mod tests {
         assert!(!same_volume(None, Some(1)));
         assert!(!same_volume(Some(1), None));
         assert!(!same_volume(None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_cache_first_classification_wins_for_same_volume() {
+        let cache = Mutex::new(HashMap::new());
+        let first = platform::FsInfo {
+            class: platform::FsClass::Local,
+            local_only_network: false,
+        };
+        let second = platform::FsInfo {
+            class: platform::FsClass::Network,
+            local_only_network: true,
+        };
+
+        assert_eq!(store_fs_info(&cache, 10, first), first);
+        assert_eq!(store_fs_info(&cache, 10, second), first);
+        assert_eq!(lock(&cache).get(&10).copied(), Some(first));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_cache_unknown_false_is_kept_first() {
+        let cache = Mutex::new(HashMap::new());
+        let failed = platform::FsInfo {
+            class: platform::FsClass::Unknown,
+            local_only_network: false,
+        };
+        let later = platform::FsInfo {
+            class: platform::FsClass::Local,
+            local_only_network: false,
+        };
+
+        assert_eq!(store_fs_info(&cache, 11, failed), failed);
+        assert_eq!(store_fs_info(&cache, 11, later), failed);
+        assert_eq!(lock(&cache).get(&11).copied(), Some(failed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_cache_keeps_class_and_local_only_combination_intact() {
+        let cache = Mutex::new(HashMap::new());
+        // 実装上は Local + true は通常現れないが、キャッシュが class と
+        // local_only_network を別々に混ぜないことを確認する。
+        let first = platform::FsInfo {
+            class: platform::FsClass::Local,
+            local_only_network: true,
+        };
+        let second = platform::FsInfo {
+            class: platform::FsClass::Network,
+            local_only_network: false,
+        };
+
+        assert_eq!(store_fs_info(&cache, 12, first), first);
+        assert_eq!(store_fs_info(&cache, 12, second), first);
+        assert_eq!(lock(&cache).get(&12).copied(), Some(first));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_volume_uses_first_fs_info_for_different_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("samevol-a")).unwrap();
+        fs::create_dir_all(root.join("samevol-b")).unwrap();
+        fs::write(root.join("samevol-a/a.txt"), b"a").unwrap();
+        fs::write(root.join("samevol-b/b.txt"), b"b").unwrap();
+
+        let mut c = cfg(&root);
+        c.want_identity = true;
+        c.threads = 1;
+        c.fs_mock = mock_fs();
+        let out = run(c, Arc::new(Progress::new()), Arc::new(Control::new()));
+
+        let a = find_node(&out, &["samevol-a"]).unwrap();
+        let b = find_node(&out, &["samevol-b"]).unwrap();
+        assert_eq!(
+            out.tree.id(a).is_known(),
+            out.tree.id(b).is_known(),
+            "same st_dev must use the same first FsInfo"
+        );
+        let af = find_node(&out, &["samevol-a", "a.txt"]).unwrap();
+        let bf = find_node(&out, &["samevol-b", "b.txt"]).unwrap();
+        assert_eq!(
+            out.tree.id(af).is_known(),
+            out.tree.id(bf).is_known(),
+            "descendants must inherit the same FsInfo"
+        );
+    }
+
+    #[cfg(unix)]
+    fn path_has_prefix(path: &Path, prefix: &str) -> bool {
+        path.components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with(prefix))
+    }
+
+    #[cfg(unix)]
+    fn mock_fs_info(path: &Path) -> platform::FsInfo {
+        if path_has_prefix(path, "recover") {
+            // ネットワーク配下にあるローカルマウント。親が不許可なので
+            // 子孫は再許可されないことを確認する。
+            platform::FsInfo {
+                class: platform::FsClass::Local,
+                local_only_network: false,
+            }
+        } else if path_has_prefix(path, "net") || path_has_prefix(path, "to_net") {
+            platform::FsInfo {
+                class: platform::FsClass::Network,
+                local_only_network: true,
+            }
+        } else if path_has_prefix(path, "fuse") {
+            platform::FsInfo {
+                class: platform::FsClass::Unknown,
+                local_only_network: true,
+            }
+        } else if path_has_prefix(path, "unknown") {
+            platform::FsInfo {
+                class: platform::FsClass::Unknown,
+                local_only_network: false,
+            }
+        } else if path_has_prefix(path, "samevol-a") {
+            platform::FsInfo {
+                class: platform::FsClass::Local,
+                local_only_network: false,
+            }
+        } else if path_has_prefix(path, "samevol-b") {
+            platform::FsInfo {
+                class: platform::FsClass::Network,
+                local_only_network: true,
+            }
+        } else {
+            platform::FsInfo {
+                class: platform::FsClass::Local,
+                local_only_network: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_fs_volume(path: &Path) -> Option<u64> {
+        if path_has_prefix(path, "recover") || path_has_prefix(path, "localmount") {
+            Some(3)
+        } else if path_has_prefix(path, "net") || path_has_prefix(path, "to_net") {
+            Some(2)
+        } else if path_has_prefix(path, "fuse") {
+            Some(5)
+        } else if path_has_prefix(path, "unknown") {
+            Some(4)
+        } else if path_has_prefix(path, "samevol-a") || path_has_prefix(path, "samevol-b") {
+            Some(6)
+        } else {
+            Some(1)
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_fs() -> Option<FsMock> {
+        Some(FsMock {
+            volume: mock_fs_volume,
+            info: mock_fs_info,
+        })
+    }
+
+    #[cfg(unix)]
+    fn find_node(out: &ScanOutcome, names: &[&str]) -> Option<u32> {
+        let mut cur = out.tree.root;
+        for name in names {
+            cur = out
+                .tree
+                .node(cur)
+                .children
+                .iter()
+                .copied()
+                .find(|&i| out.tree.node(i).name.to_string_lossy() == *name)?;
+        }
+        Some(cur)
+    }
+
+    #[cfg(unix)]
+    fn assert_unknown(out: &ScanOutcome, names: &[&str]) {
+        let idx = find_node(out, names).unwrap_or_else(|| panic!("node {names:?}"));
+        assert_eq!(
+            out.tree.id(idx),
+            FileId::UNKNOWN,
+            "ID must be UNKNOWN: {names:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_known(out: &ScanOutcome, names: &[&str]) {
+        let idx = find_node(out, names).unwrap_or_else(|| panic!("node {names:?}"));
+        assert!(out.tree.id(idx).is_known(), "ID must be known: {names:?}");
     }
 
     fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
@@ -1218,5 +1602,183 @@ mod tests {
             out.tree.node(out.tree.root).file_count >= 1,
             "エラー後も走査を継続していません"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_network_and_unknown_suppress_identity_and_delete() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("local.txt"), b"local").unwrap();
+        fs::create_dir_all(root.join("localmount")).unwrap();
+        fs::write(root.join("localmount/local.txt"), b"local").unwrap();
+        fs::create_dir_all(root.join("net/deep")).unwrap();
+        fs::write(root.join("net/net.txt"), b"net").unwrap();
+        fs::write(root.join("net/deep/deep.txt"), b"net").unwrap();
+        fs::create_dir_all(root.join("net/recover")).unwrap();
+        fs::write(root.join("net/recover/recover.txt"), b"local").unwrap();
+        fs::create_dir_all(root.join("unknown")).unwrap();
+        fs::write(root.join("unknown/u.txt"), b"unknown").unwrap();
+        fs::create_dir_all(root.join("fuse")).unwrap();
+        fs::write(root.join("fuse/f.txt"), b"fuse").unwrap();
+        symlink(root.join("local.txt"), root.join("net/lnk")).unwrap();
+
+        let mut c = cfg(&root);
+        c.want_identity = true;
+        c.threads = 2;
+        c.fs_mock = mock_fs();
+        let out = run(c, Arc::new(Progress::new()), Arc::new(Control::new()));
+
+        assert!(out.tree.id(0).is_known(), "local root ID");
+        assert_known(&out, &["local.txt"]);
+        assert_known(&out, &["localmount"]);
+        assert_known(&out, &["localmount", "local.txt"]);
+
+        for names in [
+            &["net"][..],
+            &["net", "net.txt"],
+            &["net", "deep"],
+            &["net", "deep", "deep.txt"],
+            &["net", "recover"],
+            &["net", "recover", "recover.txt"],
+            &["unknown"],
+            &["unknown", "u.txt"],
+            &["fuse"],
+            &["fuse", "f.txt"],
+            &["net", "lnk"],
+        ] {
+            assert_unknown(&out, names);
+        }
+
+        // ネットワーク / Unknown 上の削除は拒否し、ローカルは成功する。
+        for (rel, names) in [
+            ("net/net.txt", &["net", "net.txt"][..]),
+            ("unknown/u.txt", &["unknown", "u.txt"][..]),
+            ("fuse/f.txt", &["fuse", "f.txt"][..]),
+        ] {
+            let idx = find_node(&out, names).unwrap();
+            let path = root.join(rel);
+            let err = crate::delete::remove_target(
+                &path,
+                out.tree.node(idx).kind,
+                out.tree.id(idx),
+                out.tree.id_link_like(idx),
+            )
+            .unwrap_err();
+            assert!(err.contains("走査時"), "{rel}: {err}");
+            assert!(path.exists(), "{rel}");
+        }
+
+        let local_idx = find_node(&out, &["local.txt"]).unwrap();
+        crate::delete::remove_target(
+            &root.join("local.txt"),
+            out.tree.node(local_idx).kind,
+            out.tree.id(local_idx),
+            out.tree.id_link_like(local_idx),
+        )
+        .unwrap();
+        assert!(!root.join("local.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_network_or_unknown_suppresses_all_identity() {
+        let dir = tempdir().unwrap();
+        for name in ["net-root", "unknown-root"] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("f.txt"), b"x").unwrap();
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("sub/g.txt"), b"y").unwrap();
+
+            let mut c = cfg(&root);
+            c.want_identity = true;
+            c.fs_mock = mock_fs();
+            let out = run(c, Arc::new(Progress::new()), Arc::new(Control::new()));
+
+            assert!(
+                !out.tree.id(0).is_known(),
+                "root ID must be UNKNOWN: {name}"
+            );
+            assert_unknown(&out, &["f.txt"]);
+            assert_unknown(&out, &["sub"]);
+            assert_unknown(&out, &["sub", "g.txt"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn followed_link_uses_target_scope_not_parent_scope() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.join("net2")).unwrap();
+        fs::write(outside.join("net2/n.txt"), b"net").unwrap();
+        fs::create_dir_all(outside.join("local2")).unwrap();
+        fs::write(outside.join("local2/l.txt"), b"local").unwrap();
+        symlink(outside.join("net2"), root.join("to_net")).unwrap();
+        symlink(outside.join("local2"), root.join("to_local")).unwrap();
+        symlink(outside.join("net2/n.txt"), root.join("to_net_file")).unwrap();
+
+        let mut c = cfg(&root);
+        c.want_identity = true;
+        c.follow_links = true;
+        c.threads = 1;
+        c.fs_mock = mock_fs();
+        let out = run(c, Arc::new(Progress::new()), Arc::new(Control::new()));
+
+        // リンク自体はローカルにあるため ID を持つ。
+        assert_known(&out, &["to_net"]);
+        assert_known(&out, &["to_local"]);
+        // リンク先の分類は独立しており、ネットワーク先の子孫は UNKNOWN。
+        assert_unknown(&out, &["to_net", "n.txt"]);
+        assert_known(&out, &["to_local", "l.txt"]);
+
+        // ファイルリンクはリンク自身の ID を保持し、リンク先の ID は使わない。
+        let link_idx = find_node(&out, &["to_net_file"]).unwrap();
+        let link_path = root.join("to_net_file");
+        let link_md = std::fs::symlink_metadata(&link_path).unwrap();
+        let link_id = platform::file_id(&link_md, &link_path, true).unwrap();
+        let target_md = std::fs::metadata(outside.join("net2/n.txt")).unwrap();
+        let target_id = platform::file_id(&target_md, &outside.join("net2/n.txt"), false).unwrap();
+        assert_eq!(out.tree.id(link_idx), link_id);
+        assert_ne!(link_id, target_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_only_uses_legacy_network_flag_not_identity_class() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("fuse")).unwrap();
+        fs::write(root.join("fuse/f.txt"), b"fuse").unwrap();
+        fs::create_dir_all(root.join("unknown")).unwrap();
+        fs::write(root.join("unknown/u.txt"), b"unknown").unwrap();
+        fs::create_dir_all(root.join("local")).unwrap();
+        fs::write(root.join("local/l.txt"), b"local").unwrap();
+
+        let mut c = cfg(&root);
+        c.want_identity = true;
+        c.local_only = true;
+        c.threads = 1;
+        c.fs_mock = mock_fs();
+        let out = run(c, Arc::new(Progress::new()), Arc::new(Control::new()));
+
+        let fuse = find_node(&out, &["fuse"]).unwrap();
+        assert_eq!(out.tree.node(fuse).kind, NodeKind::Blocked);
+        // FUSE は local_only_network=true のため走査対象外。
+        assert_unknown(&out, &["fuse"]);
+        assert!(find_node(&out, &["fuse", "f.txt"]).is_none());
+        // Unknown は既存 --local-only では除外しないが、ID は収集しない。
+        assert!(find_node(&out, &["unknown", "u.txt"]).is_some());
+        assert_unknown(&out, &["unknown"]);
+        assert_unknown(&out, &["unknown", "u.txt"]);
+        assert_known(&out, &["local", "l.txt"]);
     }
 }

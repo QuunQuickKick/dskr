@@ -377,21 +377,74 @@ pub fn is_reparse_point(_md: &Metadata) -> bool {
     false
 }
 
-/// ネットワークファイルシステムか (--local-only の強制モードで使用)。
+/// ファイルシステムの安全性分類。
+///
+/// `Unknown` は「ローカルと確認できない」ことを表し、削除用 ID の収集を
+/// 禁止する。`--local-only` の既存挙動とは別に扱う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsClass {
+    Local,
+    Network,
+    Unknown,
+}
+
+/// 1 回の `statfs` から得る分類結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsInfo {
+    /// 削除用 ID を収集してよいかの分類。
+    pub class: FsClass,
+    /// 既存 `--local-only` の `is_network_fs()` と同じ判定。
+    pub local_only_network: bool,
+}
+
+impl FsInfo {
+    const fn new(class: FsClass, local_only_network: bool) -> Self {
+        FsInfo {
+            class,
+            local_only_network,
+        }
+    }
+}
+
+/// メタデータからファイルシステムの識別子 (Unix の st_dev) を取り出す。
+/// 追加の stat は行わない。Windows では None。
+pub fn metadata_volume(md: &Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
+}
+
+/// パスのファイルシステムを分類する。
+///
+/// `statfs` 失敗、未知の種別、その他の Unix は `Unknown` を返す。
+/// これは削除用 ID を収集しない安全側の判定であり、`--local-only` の
+/// ネットワーク判定とは独立している。
 #[cfg(target_os = "linux")]
-pub fn is_network_fs(path: &Path) -> bool {
+pub fn classify_fs(path: &Path) -> FsInfo {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = match CString::new(path.as_os_str().as_bytes()) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return FsInfo::new(FsClass::Unknown, false),
     };
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
-        return false;
+        return FsInfo::new(FsClass::Unknown, false);
     }
-    let magic = st.f_type as u64;
-    matches!(
+    linux_fs_info(st.f_type as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fs_info(magic: u64) -> FsInfo {
+    // 既存の --local-only 判定を維持するためのネットワーク一覧。
+    let local_only_network = matches!(
         magic,
         0x6969          // NFS
             | 0xFF53_4D42   // CIFS
@@ -404,39 +457,103 @@ pub fn is_network_fs(path: &Path) -> bool {
             | 0x564C        // NCP
             | 0x00C3_6400   // CEPH
             | 0x4750_4653   // GPFS
-            | 0x6165_676C   // LUSTRE
-            | 0x0187 // AUTOFS (アクセス時に自動マウントされるため除外)
-    )
+            | 0x6165_676C   // LUSTRE (値の由来が不明瞭なため ID 分類では Unknown)
+            | 0x0187 // AUTOFS
+    );
+
+    let class = match magic {
+        // 明確なネットワークファイルシステム。
+        0x6969 | 0xFF53_4D42 | 0xFE53_4D42 | 0x517B | 0x0102_1997 | 0x5346_414F
+        | 0x7375_7245 | 0x564C | 0x00C3_6400 | 0x4750_4653 => FsClass::Network,
+        // FUSE / autofs / 由来が不明瞭なものは、種別だけではローカルと
+        // 断定できないため Unknown。
+        0x6573_5546 | 0x0187 | 0x6165_676C => FsClass::Unknown,
+        // 明確なローカルファイルシステムのホワイトリスト。
+        0xEF53          // ext2/3/4
+        | 0x58465342    // XFS
+        | 0x9123683E    // Btrfs
+        | 0x2FC12FC1    // ZFS
+        | 0xF2F52010    // F2FS
+        | 0x2011BAB0    // exFAT
+        | 0x4D44        // FAT / vfat
+        | 0x5346544E    // NTFS
+        | 0x9660        // ISO9660
+        | 0x15013346    // UDF
+        | 0x73717368    // SquashFS
+        | 0x3434        // NILFS2
+        | 0x3153464A    // JFS
+        | 0x52654973    // ReiserFS
+        | 0x7461636F    // OCFS2
+        | 0x01161970    // GFS2
+        | 0xCA451A4E    // bcachefs
+        | 0x01021994    // tmpfs
+        | 0x858458F6    // ramfs / rootfs
+        | 0x794C7630    // overlayfs
+        | 0xF15F        // eCryptfs
+        | 0x137F        // Minix v1
+        | 0x2468        // Minix v2
+        | 0x4D5A        // Minix v3
+        => FsClass::Local,
+        _ => FsClass::Unknown,
+    };
+    FsInfo::new(class, local_only_network)
 }
 
 #[cfg(target_os = "macos")]
-pub fn is_network_fs(path: &Path) -> bool {
+pub fn classify_fs(path: &Path) -> FsInfo {
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
     let c = match CString::new(path.as_os_str().as_bytes()) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return FsInfo::new(FsClass::Unknown, false),
     };
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
-        return false;
+        return FsInfo::new(FsClass::Unknown, false);
     }
     let name = unsafe { CStr::from_ptr(st.f_fstypename.as_ptr()) }.to_string_lossy();
-    matches!(
-        name.as_ref(),
+    macos_fs_info(st.f_flags, name.as_ref())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_fs_info(flags: u32, fstypename: &str) -> FsInfo {
+    // 既存の --local-only 判定を維持する。
+    let local_only_network = matches!(
+        fstypename,
         "nfs" | "smbfs" | "afpfs" | "webdav" | "ftp" | "cddafs" | "autofs"
-    )
+    );
+
+    // 明確なネットワーク名を最優先する。
+    let class = if matches!(
+        fstypename,
+        "nfs" | "smbfs" | "afpfs" | "webdav" | "ftp" | "cddafs"
+    ) {
+        FsClass::Network
+    } else if fstypename == "autofs" {
+        // autofs はトリガであり、マウント先の種別を保証しない。
+        FsClass::Unknown
+    } else if flags & (libc::MNT_LOCAL as u32) != 0 {
+        FsClass::Local
+    } else {
+        FsClass::Unknown
+    };
+    FsInfo::new(class, local_only_network)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub fn is_network_fs(_path: &Path) -> bool {
-    false
+pub fn classify_fs(_path: &Path) -> FsInfo {
+    FsInfo::new(FsClass::Unknown, false)
 }
 
-/// Windows ではネットワーク判定をボリューム一致で行うため、ここでは false。
+/// Windows ではネットワーク判定をボリューム一致で行うため、ここでは Unknown。
 #[cfg(windows)]
-pub fn is_network_fs(_path: &Path) -> bool {
-    false
+pub fn classify_fs(_path: &Path) -> FsInfo {
+    FsInfo::new(FsClass::Unknown, false)
+}
+
+/// ネットワークファイルシステムか (既存 `--local-only` 用)。
+pub fn is_network_fs(path: &Path) -> bool {
+    classify_fs(path).local_only_network
 }
 
 /// リンク先が明らかにルートと別のボリューム/サーバーを指すか (Windows)。
@@ -815,6 +932,82 @@ mod tests {
 
         let twin_md = std::fs::symlink_metadata(&twin).unwrap();
         assert_eq!(Some(id), file_id(&twin_md, &twin, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fs_classes_are_tri_state_and_preserve_local_only() {
+        let network = [
+            0x6969,
+            0xFF53_4D42,
+            0xFE53_4D42,
+            0x517B,
+            0x0102_1997,
+            0x5346_414F,
+            0x7375_7245,
+            0x564C,
+            0x00C3_6400,
+            0x4750_4653,
+        ];
+        for magic in network {
+            let info = linux_fs_info(magic);
+            assert_eq!(info.class, FsClass::Network, "{magic:#x}");
+            assert!(info.local_only_network, "{magic:#x}");
+        }
+
+        for magic in [0x6573_5546, 0x0187, 0x6165_676C] {
+            let info = linux_fs_info(magic);
+            assert_eq!(info.class, FsClass::Unknown, "{magic:#x}");
+            assert!(info.local_only_network, "{magic:#x}");
+        }
+
+        for magic in [
+            0xEF53, 0x58465342, 0x9123683E, 0x2FC12FC1, 0xF2F52010, 0x2011BAB0, 0x4D44, 0x5346544E,
+            0x9660, 0x15013346, 0x73717368, 0x3434, 0x3153464A, 0x52654973, 0x7461636F, 0x01161970,
+            0xCA451A4E, 0x01021994, 0x858458F6, 0x794C7630, 0xF15F,
+        ] {
+            let info = linux_fs_info(magic);
+            assert_eq!(info.class, FsClass::Local, "{magic:#x}");
+            assert!(!info.local_only_network, "{magic:#x}");
+        }
+
+        let unknown = linux_fs_info(0xDEAD_BEEF);
+        assert_eq!(unknown.class, FsClass::Unknown);
+        assert!(!unknown.local_only_network);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fs_classes_use_network_names_then_mnt_local() {
+        let local = libc::MNT_LOCAL as u32;
+        for name in ["apfs", "hfs", "exfat", "msdos"] {
+            let info = macos_fs_info(local, name);
+            assert_eq!(info.class, FsClass::Local, "{name}");
+            assert!(!info.local_only_network, "{name}");
+        }
+
+        for name in ["nfs", "smbfs", "afpfs", "webdav", "ftp", "cddafs"] {
+            let info = macos_fs_info(0, name);
+            assert_eq!(info.class, FsClass::Network, "{name}");
+            assert!(info.local_only_network, "{name}");
+        }
+
+        let autofs = macos_fs_info(local, "autofs");
+        assert_eq!(autofs.class, FsClass::Unknown);
+        assert!(autofs.local_only_network);
+
+        let unknown = macos_fs_info(0, "unknownfs");
+        assert_eq!(unknown.class, FsClass::Unknown);
+        assert!(!unknown.local_only_network);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_volume_matches_metadata_device() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let md = std::fs::metadata(dir.path()).unwrap();
+        assert_eq!(metadata_volume(&md), Some(md.dev()));
     }
 }
 

@@ -54,7 +54,10 @@ fn verify_target(
     let link_like = ft.is_symlink() || platform::is_reparse_point(&md);
 
     if !expected.is_known() {
-        return Err("走査時にファイル識別情報を取得できなかったため、削除を中止しました".into());
+        return Err(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
+                .into(),
+        );
     }
     let Some(current) = platform::file_id(&md, &fs_path, link_like) else {
         return Err("削除対象のファイル識別情報を取得できないため、削除を中止しました".into());
