@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Sender};
 
-use super::node::{Node, Tree};
+use super::node::{FileId, Node, Tree};
 use super::platform;
 use crate::path;
 
@@ -163,6 +163,8 @@ pub struct EngineConfig {
     pub rate_limit: u64,
     pub skip_cloud_placeholders: bool,
     pub want_allocated: bool,
+    /// 削除時の同一性検証用のファイル ID を収集する (`--allow-delete` 時のみ)。
+    pub want_identity: bool,
     pub skip_pseudo: bool,
     /// ネットワークプロファイル (UNC / マウントされたネットワークFS)。
     /// Windows では追加のネットワーク往復を避けるためハードリンク判定を省略し、
@@ -194,6 +196,8 @@ pub struct ScanOutcome {
     pub elapsed: Duration,
     pub root: PathBuf,
 }
+
+type PendingNode = (Node, Option<(u64, u64)>, FileId);
 
 enum Msg {
     Dir {
@@ -321,10 +325,15 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
     let root_mtime = root_md.as_ref().map(platform::mtime_secs).unwrap_or(0);
     let root_volume = platform::volume_of(&fs_root);
 
-    let tree_arc = Arc::new(Mutex::new(Tree::with_root(
-        cfg.root.as_os_str().to_owned(),
-        root_mtime,
-    )));
+    let mut initial_tree = Tree::with_root(cfg.root.as_os_str().to_owned(), root_mtime);
+    if cfg.want_identity {
+        if let Some(md) = &root_md {
+            if let Some(id) = platform::file_id(md, &fs_root, false) {
+                initial_tree.set_id(0, id);
+            }
+        }
+    }
+    let tree_arc = Arc::new(Mutex::new(initial_tree));
     let root = lock(&tree_arc).root;
 
     let mut visited = HashSet::new();
@@ -568,7 +577,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
         }
     };
 
-    let mut batch: Vec<(Node, Option<(u64, u64)>)> = Vec::new();
+    let mut batch: Vec<PendingNode> = Vec::new();
 
     for entry_result in rd {
         if sh.control.state() == ControlState::Cancelling {
@@ -646,13 +655,16 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 None
             };
             if !sh.dir_allowed(&child_path, volume, false) {
+                let id = sh.identity(&md, &child_path, false);
                 batch.push((
                     Node::blocked(name, node, depth + 1, platform::mtime_secs(&md)),
                     None,
+                    id,
                 ));
                 continue;
             }
             if sh.cfg.follow_links && !sh.mark_visited(&md, &child_path) {
+                let id = sh.identity(&md, &child_path, false);
                 batch.push((
                     Node::other(
                         name,
@@ -663,30 +675,44 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                         platform::mtime_secs(&md),
                     ),
                     None,
+                    id,
                 ));
                 continue;
             }
-            if !sh.queue_dir(node, name, child_path, depth + 1, platform::mtime_secs(&md)) {
+            let id = sh.identity(&md, &child_path, false);
+            if !sh.queue_dir(
+                node,
+                name,
+                child_path,
+                depth + 1,
+                platform::mtime_secs(&md),
+                id,
+            ) {
                 break; // ノード上限、またはワーカー停止
             }
             continue;
         }
 
         if ft.is_file() {
-            sh.add_file(&mut batch, name, node, depth + 1, &md, &child_path);
+            sh.add_file(&mut batch, name, node, depth + 1, &md, &child_path, None);
             continue;
         }
 
         // シンボリックリンク / 再解析ポイント (ジャンクション等) / 特殊ファイル
         // 既定では辿らない。辿るのは --follow-links 指定時のみ。
+        let leaf_id = sh.identity(&md, &child_path, ft.is_symlink() || is_reparse);
         let leaf = || {
-            Node::other(
-                name.clone(),
-                node,
-                depth + 1,
-                0,
-                md.len(),
-                platform::mtime_secs(&md),
+            (
+                Node::other(
+                    name.clone(),
+                    node,
+                    depth + 1,
+                    0,
+                    md.len(),
+                    platform::mtime_secs(&md),
+                ),
+                None,
+                leaf_id,
             )
         };
         if (ft.is_symlink() || is_reparse) && sh.cfg.follow_links {
@@ -694,13 +720,13 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
             // リンク先のメタデータ取得自体が別FS (ネットワーク等) への
             // アクセスになり得るため。
             if sh.cfg.local_only || sh.cfg.one_file_system {
-                batch.push((leaf(), None));
+                batch.push(leaf());
                 continue;
             }
             // Windows: リンク先が別ドライブ/UNC なら辿らない (read_link は外部に触れない)
             #[cfg(windows)]
             if platform::link_leaves_volume(&child_path, sh.root_drive) {
-                batch.push((leaf(), None));
+                batch.push(leaf());
                 continue;
             }
             let volume = if sh.wants_volume(true) {
@@ -709,25 +735,27 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 None
             };
             if sh.link_cross_blocked(volume) {
-                batch.push((leaf(), None));
+                batch.push(leaf());
                 continue;
             }
             match fs::metadata(&child_path) {
                 Ok(tmd) if tmd.is_dir() => {
                     if !sh.dir_allowed(&child_path, volume, true) {
-                        batch.push((leaf(), None));
+                        batch.push(leaf());
                         continue;
                     }
                     if !sh.mark_visited(&tmd, &child_path) {
-                        batch.push((leaf(), None));
+                        batch.push(leaf());
                         continue;
                     }
+                    let link_id = sh.identity(&md, &child_path, true);
                     if !sh.queue_dir(
                         node,
                         name,
                         child_path,
                         depth + 1,
                         platform::mtime_secs(&tmd),
+                        link_id,
                     ) {
                         break;
                     }
@@ -735,14 +763,24 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                 Ok(tmd) => {
                     // リンク先がファイルの場合も直接走査と同じフィルタ
                     // (min_size / クラウドプレースホルダ) を適用する。
-                    sh.add_file(&mut batch, name, node, depth + 1, &tmd, &child_path);
+                    // サイズはリンク先、削除時の ID はリンク自身を使う。
+                    let link_id = sh.identity(&md, &child_path, true);
+                    sh.add_file(
+                        &mut batch,
+                        name,
+                        node,
+                        depth + 1,
+                        &tmd,
+                        &child_path,
+                        Some(link_id),
+                    );
                 }
                 Err(e) => {
                     sh.record_error(&child_path, e.to_string(), Some(node));
                 }
             }
         } else {
-            batch.push((leaf(), None));
+            batch.push(leaf());
         }
     }
 
@@ -750,9 +788,12 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
         let mut links: Vec<(u32, (u64, u64))> = Vec::new();
         {
             let mut t = lock(&sh.tree);
-            for (n, hardlink) in batch {
+            for (n, hardlink, id) in batch {
                 match sh.push_locked(&mut t, node, n) {
                     Some(idx) => {
+                        if id.is_known() {
+                            t.set_id(idx, id);
+                        }
                         if let Some(key) = hardlink {
                             links.push((idx, key));
                         }
@@ -849,17 +890,27 @@ impl Shared {
         !(self.cfg.network && cfg!(windows))
     }
 
+    /// 削除時の同一性検証用 ID。要求されていない場合は `UNKNOWN`。
+    fn identity(&self, md: &Metadata, path: &Path, link_like: bool) -> FileId {
+        if !self.cfg.want_identity {
+            return FileId::UNKNOWN;
+        }
+        platform::file_id(md, path, link_like).unwrap_or(FileId::UNKNOWN)
+    }
+
     /// ファイルノードをバッチへ追加する。min_size とクラウドプレースホルダ
     /// 除外を適用し、ハードリンクの重複計上もここで処理する。
     /// 追加した場合は true を返す。
+    #[allow(clippy::too_many_arguments)]
     fn add_file(
         &self,
-        batch: &mut Vec<(Node, Option<(u64, u64)>)>,
+        batch: &mut Vec<PendingNode>,
         name: OsString,
         parent: u32,
         depth: u16,
         md: &Metadata,
         path: &Path,
+        id_override: Option<FileId>,
     ) -> bool {
         let logical = md.len();
         if logical < self.cfg.min_size {
@@ -873,7 +924,13 @@ impl Shared {
         // そうしないと TUI の「ディスク使用量」切替や JSON の allocated が
         // 見かけのサイズになってしまう。ネットワークでは余計な往復を避ける。
         let collect_alloc = self.cfg.want_allocated || (cfg!(windows) && !self.cfg.network);
-        let info = platform::file_size_info(md, path, collect_alloc, self.want_hardlink());
+        let info = platform::file_size_info(
+            md,
+            path,
+            collect_alloc,
+            self.want_hardlink(),
+            self.cfg.want_identity,
+        );
         if collect_alloc && !info.alloc_exact {
             self.record_error(
                 path,
@@ -893,6 +950,7 @@ impl Shared {
             }
             None => info.alloc,
         };
+        let id = id_override.or(info.id).unwrap_or(FileId::UNKNOWN);
         batch.push((
             Node::file(
                 name,
@@ -903,6 +961,7 @@ impl Shared {
                 platform::mtime_secs(md),
             ),
             info.hardlink,
+            id,
         ));
         self.progress
             .bytes_alloc
@@ -922,11 +981,17 @@ impl Shared {
         path: PathBuf,
         depth: u16,
         mtime: i64,
+        id: FileId,
     ) -> bool {
         let idx = {
             let mut t = lock(&self.tree);
             match self.push_locked(&mut t, parent, Node::dir(name, parent, depth, mtime)) {
-                Some(i) => i,
+                Some(i) => {
+                    if id.is_known() {
+                        t.set_id(i, id);
+                    }
+                    i
+                }
                 None => return false,
             }
         };
@@ -998,6 +1063,7 @@ mod tests {
             rate_limit: 0,
             skip_cloud_placeholders: false,
             want_allocated: true,
+            want_identity: false,
             skip_pseudo: false,
             network: false,
             local_only: false,

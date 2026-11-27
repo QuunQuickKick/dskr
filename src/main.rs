@@ -155,6 +155,7 @@ fn try_main(cli: Cli) -> Result<u32, String> {
         rate_limit: rate,
         skip_cloud_placeholders: cli.skip_cloud_placeholders,
         want_allocated,
+        want_identity: cli.allow_delete,
         skip_pseudo,
         network: network_profile,
         local_only: cli.local_only,

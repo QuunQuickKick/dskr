@@ -994,6 +994,7 @@ mod tests {
             node: 1,
             path: std::path::PathBuf::from("/tmp/victim"),
             kind: NodeKind::Dir,
+            expected: crate::scan::node::FileId::UNKNOWN,
             bytes: 1024,
             files: 3,
             dirs: 1,

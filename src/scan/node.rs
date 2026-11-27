@@ -1,5 +1,29 @@
 use std::ffi::{OsStr, OsString};
 
+/// 走査時と削除時の同一性を確認するためのファイル識別子。
+///
+/// Unix では `(device, inode)`、Windows では
+/// `(volume serial, file index)` を保持します。値が取得できない場合は
+/// [`FileId::UNKNOWN`] を使い、削除時は安全側に倒して拒否します。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub volume: u64,
+    pub index: u64,
+}
+
+impl FileId {
+    /// 識別情報を取得できなかったことを表す。
+    pub const UNKNOWN: FileId = FileId {
+        volume: 0,
+        index: 0,
+    };
+
+    /// 有効な識別情報か。0 は OS が返さない無効値として扱う。
+    pub fn is_known(self) -> bool {
+        self.volume != 0 && self.index != 0
+    }
+}
+
 /// ノード種別。Other はシンボリックリンク・ジャンクション・特殊ファイルなど。
 /// Blocked は -x / --local-only などにより走査しないと決めた実ディレクトリ
 /// (中身は集計されない)。
@@ -129,6 +153,9 @@ impl Node {
 pub struct Tree {
     pub nodes: Vec<Node>,
     pub root: u32,
+    /// 削除時の同一性検証用のファイル ID。`--allow-delete` 時だけ設定する。
+    /// 空のときは全ノードが `FileId::UNKNOWN` として扱われる。
+    ids: Vec<FileId>,
 }
 
 impl Tree {
@@ -137,7 +164,28 @@ impl Tree {
         Tree {
             nodes: vec![root_node],
             root: 0,
+            ids: Vec::new(),
         }
+    }
+
+    /// ノードの識別情報を記録する。`UNKNOWN` は記録しない。
+    pub fn set_id(&mut self, idx: u32, id: FileId) {
+        if !id.is_known() {
+            return;
+        }
+        let i = idx as usize;
+        if i >= self.ids.len() {
+            self.ids.resize(i + 1, FileId::UNKNOWN);
+        }
+        self.ids[i] = id;
+    }
+
+    /// ノードの識別情報を返す。未収集・範囲外は `UNKNOWN`。
+    pub fn id(&self, idx: u32) -> FileId {
+        self.ids
+            .get(idx as usize)
+            .copied()
+            .unwrap_or(FileId::UNKNOWN)
     }
 
     pub fn node(&self, i: u32) -> &Node {
@@ -260,6 +308,25 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_ids_are_unknown_until_set() {
+        let mut t = Tree::with_root("root".into(), 0);
+        assert_eq!(t.id(0), FileId::UNKNOWN);
+        assert_eq!(t.id(99), FileId::UNKNOWN);
+
+        let id = FileId {
+            volume: 1,
+            index: 2,
+        };
+        t.set_id(0, id);
+        assert_eq!(t.id(0), id);
+        assert_eq!(t.id(99), FileId::UNKNOWN);
+
+        // UNKNOWN は記録しない。
+        t.set_id(0, FileId::UNKNOWN);
+        assert_eq!(t.id(0), id);
+    }
 
     #[test]
     fn aggregate_sums_subtree() {

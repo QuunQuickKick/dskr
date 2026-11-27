@@ -23,6 +23,7 @@ fn cfg(root: &Path) -> EngineConfig {
         rate_limit: 0,
         skip_cloud_placeholders: false,
         want_allocated: true,
+        want_identity: false,
         skip_pseudo: false,
         network: false,
         local_only: false,
@@ -639,4 +640,66 @@ fn json_and_csv_reports() {
         )
     );
     assert!(s.contains("a.bin,false,"));
+}
+
+#[test]
+fn identity_is_collected_only_when_requested() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    fs::write(&file, b"x").unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("b.txt"), b"y").unwrap();
+
+    let mut c = cfg(dir.path());
+    c.want_identity = true;
+    let out = scan(dir.path(), c);
+    let a = child(&out, "a.txt").unwrap();
+    let md = fs::symlink_metadata(&file).unwrap();
+    let expected = dskr::scan::platform::file_id(&md, &file, false).unwrap();
+    assert_eq!(out.tree.id(a), expected);
+
+    let sub_idx = child(&out, "sub").unwrap();
+    let sub_md = fs::symlink_metadata(&sub).unwrap();
+    let sub_id = dskr::scan::platform::file_id(&sub_md, &sub, false).unwrap();
+    assert_eq!(out.tree.id(sub_idx), sub_id);
+
+    // 既定 (--allow-delete なし) では ID を収集しない。
+    let out = scan(dir.path(), cfg(dir.path()));
+    let a = child(&out, "a.txt").unwrap();
+    assert_eq!(
+        out.tree.id(a),
+        dskr::scan::node::FileId::UNKNOWN,
+        "ID を要求していないスキャンでは保持しない"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn followed_link_records_link_identity_not_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    fs::write(&target, b"target").unwrap();
+    let link = dir.path().join("link");
+    symlink(&target, &link).unwrap();
+
+    let mut c = cfg(dir.path());
+    c.follow_links = true;
+    c.want_identity = true;
+    let out = scan(dir.path(), c);
+    let link_idx = child(&out, "link").unwrap();
+
+    let link_md = fs::symlink_metadata(&link).unwrap();
+    let link_id = dskr::scan::platform::file_id(&link_md, &link, true).unwrap();
+    let target_md = fs::metadata(&target).unwrap();
+    let target_id = dskr::scan::platform::file_id(&target_md, &target, false).unwrap();
+
+    assert_ne!(link_id, target_id);
+    assert_eq!(
+        out.tree.id(link_idx),
+        link_id,
+        "削除時の同一性はリンク自身で確認する"
+    );
 }

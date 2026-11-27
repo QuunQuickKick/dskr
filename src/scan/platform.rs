@@ -5,6 +5,8 @@ use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::path::Path;
 
+use super::node::FileId;
+
 #[cfg(windows)]
 use crate::cli::IoPriority;
 #[cfg(unix)]
@@ -22,6 +24,8 @@ pub struct FileSizeInfo {
     /// 同一実体の判定キー。ハードリンク数が 2 以上のファイルのみ設定される。
     /// 取得できない、または重複排除が不要な場合は None。
     pub hardlink: Option<(u64, u64)>,
+    /// 削除時の同一性検証用の ID。要求されない、または取得できない場合は None。
+    pub id: Option<FileId>,
 }
 
 /// ファイルの割当サイズとハードリンクキーを取得する。
@@ -35,6 +39,7 @@ pub fn file_size_info(
     path: &Path,
     want_alloc: bool,
     want_hardlink: bool,
+    want_identity: bool,
 ) -> FileSizeInfo {
     #[cfg(unix)]
     {
@@ -51,23 +56,29 @@ pub fn file_size_info(
             } else {
                 None
             },
+            id: if want_identity {
+                file_id(md, path, false)
+            } else {
+                None
+            },
         }
     }
     #[cfg(windows)]
     {
-        if !want_alloc && !want_hardlink {
+        if !want_alloc && !want_hardlink && !want_identity {
             return FileSizeInfo {
                 alloc: md.len(),
                 alloc_exact: false,
                 hardlink: None,
+                id: None,
             };
         }
         if merged_handle_disabled() {
-            return fallback_size_info(md, path, want_alloc, want_hardlink);
+            return fallback_size_info(md, path, want_alloc, want_hardlink, want_identity);
         }
-        match file_size_info_by_handle(md, path, want_alloc, want_hardlink) {
+        match file_size_info_by_handle(md, path, want_alloc, want_hardlink, want_identity) {
             Some(info) => info,
-            None => fallback_size_info(md, path, want_alloc, want_hardlink),
+            None => fallback_size_info(md, path, want_alloc, want_hardlink, want_identity),
         }
     }
 }
@@ -79,6 +90,7 @@ fn fallback_size_info(
     path: &Path,
     want_alloc: bool,
     want_hardlink: bool,
+    want_identity: bool,
 ) -> FileSizeInfo {
     let (alloc, alloc_exact) = if want_alloc {
         match get_compressed_size(path) {
@@ -93,6 +105,11 @@ fn fallback_size_info(
         alloc_exact,
         hardlink: if want_hardlink {
             hardlink_info_by_handle(path)
+        } else {
+            None
+        },
+        id: if want_identity {
+            file_id(md, path, false)
         } else {
             None
         },
@@ -112,6 +129,7 @@ fn file_size_info_by_handle(
     path: &Path,
     want_alloc: bool,
     want_hardlink: bool,
+    want_identity: bool,
 ) -> Option<FileSizeInfo> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -139,7 +157,8 @@ fn file_size_info_by_handle(
     }
 
     let mut hardlink = None;
-    if want_hardlink {
+    let mut id = None;
+    if want_hardlink || want_identity {
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
         if ok == 0 || info.dwVolumeSerialNumber == 0 {
@@ -155,8 +174,14 @@ fn file_size_info_by_handle(
             }
             return None;
         }
+        if want_identity {
+            id = Some(FileId {
+                volume: info.dwVolumeSerialNumber as u64,
+                index,
+            });
+        }
         // リンク数 1 のファイルは重複排除の対象外。
-        if info.nNumberOfLinks > 1 {
+        if want_hardlink && info.nNumberOfLinks > 1 {
             hardlink = Some((info.dwVolumeSerialNumber as u64, index));
         }
     }
@@ -198,6 +223,7 @@ fn file_size_info_by_handle(
         alloc,
         alloc_exact,
         hardlink,
+        id,
     })
 }
 
@@ -251,6 +277,67 @@ fn handle_file_info(path: &Path, hardlink_only: bool) -> Option<(u64, u64)> {
         return None;
     }
     Some((info.dwVolumeSerialNumber as u64, index))
+}
+
+/// 削除時の同一性検証に使うファイル ID を取得する。
+///
+/// Unix は `symlink_metadata` 相当の `md` から `(device, inode)` を返す。
+/// Windows は `path` を開いて `(volume serial, file index)` を返す。
+/// `link_like` が true のときはリンク先を辿らず、リンク自身の ID を返す。
+#[cfg(unix)]
+pub fn file_id(md: &Metadata, _path: &Path, _link_like: bool) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let (volume, index) = (md.dev(), md.ino());
+    if volume == 0 || index == 0 {
+        return None;
+    }
+    Some(FileId { volume, index })
+}
+
+#[cfg(windows)]
+pub fn file_id(_md: &Metadata, path: &Path, link_like: bool) -> Option<FileId> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if link_like {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let wide = to_wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return None;
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if ok == 0 || info.dwVolumeSerialNumber == 0 {
+        return None;
+    }
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    if index == 0 {
+        return None;
+    }
+    Some(FileId {
+        volume: info.dwVolumeSerialNumber as u64,
+        index,
+    })
 }
 
 /// ディレクトリが属するボリュームの識別子 (--one-file-system 用)。
@@ -699,16 +786,35 @@ mod tests {
         let file = dir.path().join("a");
         std::fs::write(&file, b"x").unwrap();
         let md = std::fs::metadata(&file).unwrap();
-        let info = file_size_info(&md, &file, true, true);
+        let info = file_size_info(&md, &file, true, true, true);
         assert!(info.alloc_exact);
         assert_eq!(info.hardlink, None, "リンク数1ではキーを作らない");
+        assert!(info.id.is_some(), "ID を要求したら取得する");
 
         let twin = dir.path().join("b");
         std::fs::hard_link(&file, &twin).unwrap();
         let md = std::fs::metadata(&file).unwrap();
-        let info = file_size_info(&md, &file, true, true);
+        let info = file_size_info(&md, &file, true, true, true);
         assert!(info.alloc_exact);
         assert!(info.hardlink.is_some(), "ハードリンクではキーを作る");
+        assert_eq!(info.id, file_id(&md, &file, false));
+    }
+
+    #[test]
+    fn file_id_is_stable_and_hardlinks_share_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a");
+        std::fs::write(&file, b"x").unwrap();
+        let twin = dir.path().join("b");
+        std::fs::hard_link(&file, &twin).unwrap();
+
+        let md = std::fs::symlink_metadata(&file).unwrap();
+        let id = file_id(&md, &file, false).expect("ID を取得できる");
+        assert!(id.is_known());
+        assert_eq!(Some(id), file_id(&md, &file, false));
+
+        let twin_md = std::fs::symlink_metadata(&twin).unwrap();
+        assert_eq!(Some(id), file_id(&twin_md, &twin, false));
     }
 }
 
@@ -917,8 +1023,8 @@ mod win_real_env_tests {
         let md = fs::symlink_metadata(&case.path).unwrap();
         let old_alloc = get_compressed_size(&case.path);
         let old_key = hardlink_info_by_handle(&case.path);
-        let new = file_size_info(&md, &case.path, true, true);
-        let direct_ok = file_size_info_by_handle(&md, &case.path, true, true).is_some();
+        let new = file_size_info(&md, &case.path, true, true, false);
+        let direct_ok = file_size_info_by_handle(&md, &case.path, true, true, false).is_some();
         (
             case.name.to_string(),
             md.len(),
@@ -1006,7 +1112,7 @@ mod win_real_env_tests {
                 let _ = file_info_by_handle(p);
                 old_elapsed += t0.elapsed();
                 let t1 = Instant::now();
-                let _ = file_size_info(md, p, true, true);
+                let _ = file_size_info(md, p, true, true, false);
                 new_elapsed += t1.elapsed();
             }
         }
@@ -1027,7 +1133,7 @@ mod win_real_env_tests {
         let before = count(0);
         for _ in 0..3000 {
             for (p, md) in names.iter().zip(&mds) {
-                let _ = file_size_info(md, p, true, true);
+                let _ = file_size_info(md, p, true, true, false);
             }
         }
         let after = count(0);
@@ -1059,7 +1165,7 @@ mod win_real_env_tests {
         drop(f);
         let md = fs::symlink_metadata(&path).unwrap();
         let old_alloc = get_compressed_size(&path).unwrap();
-        let new = file_size_info(&md, &path, true, true);
+        let new = file_size_info(&md, &path, true, true, false);
         println!(
             "実4GiBファイル: 見かけ={} 旧alloc={old_alloc} 新alloc={} → {}",
             md.len(),
@@ -1139,7 +1245,7 @@ mod win_real_env_tests {
             let old_alloc = get_compressed_size(p).unwrap_or(md.len());
             old_elapsed += t0.elapsed();
             let t1 = Instant::now();
-            let new = file_size_info(&md, p, true, true);
+            let new = file_size_info(&md, p, true, true, false);
             new_elapsed += t1.elapsed();
             if old_alloc == new.alloc {
                 alloc_ok += 1;

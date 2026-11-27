@@ -10,8 +10,7 @@ use crate::output::{self, OutputFormat, OutputOptions};
 use crate::path::RootKind;
 use crate::report;
 use crate::scan::engine::{Control, ControlState, Progress, ScanOutcome};
-use crate::scan::node::{NodeKind, Tree};
-use crate::scan::platform;
+use crate::scan::node::{FileId, NodeKind, Tree};
 use crate::sort::{self, SortDir, SortField};
 
 /// TUI の `e` で選べる保存形式。
@@ -47,6 +46,8 @@ pub struct DeleteTarget {
     pub node: u32,
     pub path: PathBuf,
     pub kind: NodeKind,
+    /// 走査時に記録したファイル ID。削除直前に再照合する。
+    pub expected: FileId,
     pub bytes: u64,
     pub files: u64,
     pub dirs: u64,
@@ -354,14 +355,14 @@ impl App {
             n.truncated,
         );
         let path = self.path_of(idx);
-        // --follow-links でフォルダとして記録されたリンクでも、表示と削除は
-        // リンクとして扱う (リンク先は削除しない)。
-        let mut kind = recorded_kind;
-        if let Ok(md) = std::fs::symlink_metadata(&path) {
-            if md.file_type().is_symlink() || platform::is_reparse_point(&md) {
-                kind = NodeKind::Other;
+        let expected = t.id(idx);
+        let kind = match delete::check_target(&path, recorded_kind, expected) {
+            Ok(kind) => kind,
+            Err(e) => {
+                self.message = Some(e);
+                return;
             }
-        }
+        };
         // リンク先の中身をツリーに持つリンクを消すと、リンク先が別のパスに
         // 残っている場合に合計がずれる。安全のため削除を拒否する。
         if kind == NodeKind::Other && !n.children.is_empty() {
@@ -375,6 +376,7 @@ impl App {
             node: idx,
             path,
             kind,
+            expected,
             bytes,
             files,
             dirs,
@@ -432,7 +434,7 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
-        match delete::remove_target(&target.path, target.kind) {
+        match delete::remove_target(&target.path, target.kind, target.expected) {
             Ok(()) => {
                 if let Some(out) = self.outcome.as_mut() {
                     // 再帰削除するのは記録上 Dir のときだけ。リンクや Blocked は
@@ -916,6 +918,7 @@ fn unique_export_path(
 mod tests {
     use super::*;
     use crate::scan::node::{Node, Tree};
+    use crate::scan::platform;
     use std::time::Duration;
 
     fn test_app() -> App {
@@ -977,23 +980,45 @@ mod tests {
     /// 実ディレクトリを 1 階層分だけ読み取ってツリーを作る。
     fn finish_real_scan(app: &mut App, root: &std::path::Path) {
         let mut tree = Tree::with_root(root.as_os_str().to_owned(), 0);
+        if let Ok(md) = std::fs::symlink_metadata(root) {
+            if let Some(id) = platform::file_id(&md, root, false) {
+                tree.set_id(0, id);
+            }
+        }
         let mut entries: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let name = entry.file_name();
+            let path = entry.path();
             let md = entry.metadata().unwrap();
+            let link_like = md.file_type().is_symlink() || platform::is_reparse_point(&md);
+            let id = platform::file_id(&md, &path, link_like);
             if md.is_dir() {
                 let d = tree
                     .push_child_capped(0, Node::dir(name, 0, 1, 0), 100)
                     .unwrap();
-                for child in std::fs::read_dir(entry.path()).unwrap().flatten() {
+                if let Some(id) = id {
+                    tree.set_id(d, id);
+                }
+                for child in std::fs::read_dir(&path).unwrap().flatten() {
+                    let child_path = child.path();
                     let cmd = child.metadata().unwrap();
+                    let child_link =
+                        cmd.file_type().is_symlink() || platform::is_reparse_point(&cmd);
+                    let cid = platform::file_id(&cmd, &child_path, child_link);
                     let n = Node::file(child.file_name(), d, 2, cmd.len(), cmd.len(), 0);
-                    tree.push_child_capped(d, n, 100).unwrap();
+                    let ci = tree.push_child_capped(d, n, 100).unwrap();
+                    if let Some(cid) = cid {
+                        tree.set_id(ci, cid);
+                    }
                 }
             } else {
-                tree.push_child_capped(0, Node::file(name, 0, 1, md.len(), md.len(), 0), 100)
+                let idx = tree
+                    .push_child_capped(0, Node::file(name, 0, 1, md.len(), md.len(), 0), 100)
                     .unwrap();
+                if let Some(id) = id {
+                    tree.set_id(idx, id);
+                }
             }
         }
         tree.aggregate();
@@ -1083,6 +1108,8 @@ mod tests {
         )
         .unwrap();
         tree.aggregate();
+        let md = std::fs::symlink_metadata(&link).unwrap();
+        tree.set_id(link_idx, platform::file_id(&md, &link, true).unwrap());
 
         let mut app = test_app_at(dir.path(), true);
         app.finish(ScanOutcome {
@@ -1139,6 +1166,10 @@ mod tests {
             .push_child_capped(0, Node::file("f2".into(), 0, 1, 0, 1, 0), 100)
             .unwrap();
         tree.aggregate();
+        for (idx, path) in [(n1, &f1), (n2, &f2)] {
+            let md = std::fs::symlink_metadata(path).unwrap();
+            tree.set_id(idx, platform::file_id(&md, path, false).unwrap());
+        }
 
         let mut groups = HashMap::new();
         groups.insert((1u64, 1u64), vec![n1, n2]);
@@ -1203,6 +1234,14 @@ mod tests {
             .push_child_capped(0, Node::file("outside".into(), 0, 1, 0, 1, 0), 100)
             .unwrap();
         tree.aggregate();
+        for (idx, path) in [
+            (&sub_idx, &sub),
+            (&inside_idx, &inside),
+            (&outside_idx, &outside),
+        ] {
+            let md = std::fs::symlink_metadata(path).unwrap();
+            tree.set_id(*idx, platform::file_id(&md, path, false).unwrap());
+        }
 
         let mut groups = HashMap::new();
         groups.insert((1u64, 1u64), vec![inside_idx, outside_idx]);
@@ -1226,6 +1265,7 @@ mod tests {
             node: sub_idx,
             path: sub.clone(),
             kind: NodeKind::Dir,
+            expected: app.tree().unwrap().id(sub_idx),
             bytes: 100,
             files: 1,
             dirs: 0,
@@ -1322,6 +1362,64 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("削除できませんでした"));
+        assert_eq!(
+            app.tree()
+                .unwrap()
+                .node(app.tree().unwrap().root)
+                .file_count,
+            1
+        );
+    }
+
+    #[test]
+    fn delete_refuses_replaced_file_before_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"old").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "victim.txt");
+
+        let replacement = dir.path().join("replacement.txt");
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::remove_file(&victim).unwrap();
+        std::fs::rename(&replacement, &victim).unwrap();
+
+        app.begin_delete();
+        assert!(app.delete_target.is_none());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("置き換わっています"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"new");
+    }
+
+    #[test]
+    fn delete_refuses_replacement_after_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"old").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "victim.txt");
+
+        app.begin_delete();
+        assert!(app.delete_target.is_some());
+
+        let replacement = dir.path().join("replacement.txt");
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::remove_file(&victim).unwrap();
+        std::fs::rename(&replacement, &victim).unwrap();
+
+        app.perform_delete();
+        assert!(app.delete_target.is_none());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("置き換わっています"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"new");
         assert_eq!(
             app.tree()
                 .unwrap()

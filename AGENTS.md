@@ -61,6 +61,8 @@ Windows 向けパッケージング: `scripts/build-windows.ps1` (`build-windows
 - `src/output/` — report/tree/flat/Markdown/HTML。`src/report.rs` —
   ストリーミング JSON/CSV。
 - `src/app.rs` / `src/ui.rs` — TUI の状態と描画。
+- `src/delete.rs` — 削除前のファイル ID 検証。`--allow-delete` 時のみ走査時に
+  ID を収集し、削除直前に再取得して照合する。リンク先は辿らない。
 
 ## テストの注意点
 
