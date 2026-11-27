@@ -22,6 +22,10 @@ KEEP=${BENCH_KEEP:-1}
 DROP_CACHES=${BENCH_DROP_CACHES:-0}
 WITH_DU=${BENCH_DU:-1}
 CANCEL_AFTER_MS=${BENCH_CANCEL_AFTER_MS:-0}
+TOOLS=${BENCH_TOOLS:-""}
+GDU_CMD=${BENCH_GDU_CMD:-"gdu -n"}
+DUA_CMD=${BENCH_DUA_CMD:-"dua aggregate"}
+NCDU_CMD=${BENCH_NCDU_CMD:-"ncdu -o"}
 
 TMP_OUT=$(mktemp -d "${TMPDIR:-/tmp}/dskr-bench-out.XXXXXX")
 trap 'rm -rf "$TMP_OUT"' EXIT
@@ -55,6 +59,59 @@ if ! command -v ps >/dev/null 2>&1; then
     echo "ps コマンドが必要です" >&2
     exit 1
 fi
+
+mkdir -p "$BASE"
+
+tool_bin() {
+    local cmd=$1
+    printf '%s\n' "${cmd%% *}"
+}
+
+tool_version() {
+    local cmd=$1
+    # shellcheck disable=SC2086
+    $cmd --version 2>/dev/null | head -1 || true
+}
+
+print_metadata() {
+    local cpu fs cache
+    cpu="unknown"
+    if [ -r /proc/cpuinfo ]; then
+        cpu=$(awk -F: '/model name/{gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)
+    elif command -v sysctl >/dev/null 2>&1; then
+        cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+    fi
+    fs=$(df -h "$BASE" 2>/dev/null | tail -1 | tr -s ' ' || true)
+    if [ "$DROP_CACHES" = "1" ]; then
+        cache="cold-attempt"
+    else
+        cache="warm"
+    fi
+
+    printf '# generated_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '# os=%s\n' "$(uname -srm 2>/dev/null || echo unknown)"
+    printf '# cpu=%s\n' "${cpu:-unknown}"
+    printf '# fs=%s\n' "${fs:-unknown}"
+    printf '# cache=%s\n' "$cache"
+    printf '# base=%s\n' "$BASE"
+    printf '# sizes=%s\n' "$SIZES"
+    printf '# files_per_dir=%s file_size=%s repeats=%s warmup=%s\n' \
+        "$FILES_PER_DIR" "$FILE_SIZE" "$REPEATS" "$WARMUP"
+    printf '# dskr=%s\n' "$("$BIN" --version 2>/dev/null | head -1 || true)"
+    printf '# commit=%s\n' "$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    for tool in $TOOLS; do
+        case "$tool" in
+            gdu) cmd=$GDU_CMD ;;
+            dua) cmd=$DUA_CMD ;;
+            ncdu) cmd=$NCDU_CMD ;;
+            *) continue ;;
+        esac
+        bin=$(tool_bin "$cmd")
+        if command -v "$bin" >/dev/null 2>&1; then
+            printf '# tool=%s version=%s\n' "$tool" "$(tool_version "$cmd")"
+        fi
+    done
+}
 
 now_ns() {
     # GNU date はナノ秒まで取得できる。BSD date では秒精度にフォールバックする。
@@ -215,6 +272,40 @@ run_dskr() {
     done
 }
 
+run_tool() {
+    local tool=$1
+    local count=$2
+    local root=$3
+    local cmd
+    case "$tool" in
+        gdu) cmd=$GDU_CMD ;;
+        dua) cmd=$DUA_CMD ;;
+        ncdu) cmd=$NCDU_CMD ;;
+        *) return 0 ;;
+    esac
+
+    local bin
+    bin=$(tool_bin "$cmd")
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        echo "# skip tool=$tool count=$count reason=not-installed" >&2
+        return 0
+    fi
+
+    local -a args
+    read -r -a args <<<"$cmd"
+    local r
+    for ((r = 1; r <= REPEATS; r++)); do
+        if [ "$tool" = "ncdu" ]; then
+            measure "$tool-$count-$r" "${args[@]}" \
+                "$TMP_OUT/ncdu-$count-$r.export" "$root"
+        else
+            measure "$tool-$count-$r" "${args[@]}" "$root"
+        fi
+    done
+}
+
+print_metadata
+
 COUNTS=()
 ROOTS=()
 for count in $SIZES; do
@@ -244,6 +335,10 @@ for i in "${!COUNTS[@]}"; do
             measure "du-$count-$r" du -s "$root"
         done
     fi
+
+    for tool in $TOOLS; do
+        run_tool "$tool" "$count" "$root"
+    done
 
     if [ "$CANCEL_AFTER_MS" -gt 0 ]; then
         measure_cancel "dskr-$count-cancel" "$CANCEL_AFTER_MS" \
