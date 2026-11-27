@@ -1272,6 +1272,133 @@ mod tests {
     }
 
     #[test]
+    fn delete_while_scanning_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("victim.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "victim.txt");
+        app.scanning = true;
+
+        app.begin_delete();
+        assert!(app.delete_target.is_none());
+        assert!(file.exists());
+        assert!(app.message.as_deref().unwrap_or("").contains("走査中"));
+    }
+
+    #[test]
+    fn deleting_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"x").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        app.listing = vec![app.tree().unwrap().root];
+        app.sel = 0;
+
+        app.begin_delete();
+        assert!(app.delete_target.is_none());
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn delete_failure_keeps_tree_and_reports_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("victim.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "victim.txt");
+
+        app.begin_delete();
+        let target = app.delete_target.as_mut().unwrap();
+        target.path = dir.path().join("missing.txt");
+        app.perform_delete();
+
+        assert!(file.exists());
+        assert!(app.delete_target.is_none());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("削除できませんでした"));
+        assert_eq!(
+            app.tree()
+                .unwrap()
+                .node(app.tree().unwrap().root)
+                .file_count,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_delete_failure_keeps_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let locked = victim.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("keep"), b"x").unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "victim");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        app.begin_delete();
+        app.delete_target.as_mut().unwrap().input = "yes".into();
+        app.perform_delete();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(victim.exists());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("削除できませんでした"));
+        assert!(app
+            .tree()
+            .unwrap()
+            .node(app.tree().unwrap().root)
+            .children
+            .iter()
+            .any(|&i| app.tree().unwrap().node(i).name.to_string_lossy() == "victim"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_symlink_delete_keeps_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        select_name(&mut app, "link");
+
+        app.begin_delete();
+        assert!(app.delete_target.is_some());
+        app.perform_delete();
+
+        assert!(target.exists());
+        assert!(!link.exists());
+        assert_eq!(
+            app.tree()
+                .unwrap()
+                .node(app.tree().unwrap().root)
+                .file_count,
+            1
+        );
+    }
+
+    #[test]
     fn delete_key_is_ignored_without_option() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("victim.txt");

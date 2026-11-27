@@ -132,6 +132,25 @@ mod tests {
         assert!(victim.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn readonly_file_delete_fails_without_changing_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("readonly.txt");
+        fs::write(&file, b"x").unwrap();
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&file, perms).unwrap();
+
+        let err = remove_target(&file, NodeKind::File).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(file.exists());
+
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&file, perms).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn removes_symlink_without_following_target() {
