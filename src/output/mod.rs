@@ -855,6 +855,61 @@ mod tests {
         assert!(s.contains("\"mtime\":null"), "{s}");
     }
 
+    #[test]
+    fn deep_tree_json_and_csv_do_not_recurse() {
+        let (_unused, meta) = fixture();
+        let deep_outcome = |depth: u16| {
+            let mut tree = Tree::with_root("/root".into(), 0);
+            let mut cur = 0;
+            for i in 0..depth {
+                cur = tree
+                    .push_child_capped(
+                        cur,
+                        Node::dir(format!("d{i}").into(), cur, i + 1, 0),
+                        u64::from(depth) + 10,
+                    )
+                    .unwrap();
+            }
+            tree.push_child_capped(
+                cur,
+                Node::file("leaf".into(), cur, depth + 1, 1, 1, 0),
+                u64::from(depth) + 10,
+            )
+            .unwrap();
+            tree.aggregate();
+            ScanOutcome {
+                tree,
+                errors: Vec::new(),
+                hardlink_groups: Default::default(),
+                truncated: false,
+                cancelled: false,
+                entries: u64::from(depth) + 1,
+                dirs: u64::from(depth),
+                error_count: 0,
+                bytes_alloc: 1,
+                bytes_logical: 1,
+                elapsed: Duration::from_millis(1),
+                root: PathBuf::from("/root"),
+            }
+        };
+
+        // JSON は深いツリーでも出力できる。
+        let outcome = deep_outcome(10_000);
+        let mut json = Vec::new();
+        crate::report::write_json(&mut json, &outcome, &meta).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.starts_with('{'));
+        assert!(s.ends_with("}\n"));
+        assert_eq!(s.matches("\"name\":").count(), 10_002);
+
+        // CSV も深いツリーで行数が維持される。
+        let outcome = deep_outcome(2_000);
+        let mut csv = Vec::new();
+        crate::report::write_csv(&mut csv, &outcome, &meta).unwrap();
+        let s = String::from_utf8(csv).unwrap();
+        assert_eq!(s.lines().count(), 2_003); // header + root + dirs + leaf
+    }
+
     fn output_for_test(
         w: &mut dyn Write,
         outcome: &ScanOutcome,

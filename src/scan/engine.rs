@@ -426,6 +426,13 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         .ok()
         .map(|m| m.into_inner().unwrap_or_else(PoisonError::into_inner))
         .expect("scan: tree");
+    let mut hardlink_groups = shared
+        .hardlink_groups
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    // 走査範囲内で実際に 2 本以上見つかったものだけを残す。
+    hardlink_groups.retain(|_, nodes| nodes.len() > 1);
+    assign_hardlink_representatives(&mut tree, &mut hardlink_groups);
     tree.aggregate();
     // max_depth だけでなく、max_nodes による打ち切りもノード単位で立つ。
     // 全体レポートの truncated に反映する。
@@ -434,12 +441,6 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         .ok()
         .map(|m| m.into_inner().unwrap_or_else(PoisonError::into_inner))
         .expect("scan: errors");
-    let mut hardlink_groups = shared
-        .hardlink_groups
-        .into_inner()
-        .unwrap_or_else(PoisonError::into_inner);
-    // 走査範囲内で実際に 2 本以上見つかったものだけを残す。
-    hardlink_groups.retain(|_, nodes| nodes.len() > 1);
 
     ScanOutcome {
         entries: shared.progress.entries.load(Ordering::Relaxed),
@@ -455,6 +456,49 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
         cancelled,
         root: shared.cfg.root.clone(),
     }
+}
+
+/// ハードリンクグループの allocated を、ルートからのパス順で最小のノードへ
+/// 集約する。並列走査の順序に依存せず、フォルダ別集計を再現可能にする。
+fn assign_hardlink_representatives(tree: &mut Tree, groups: &mut HashMap<(u64, u64), Vec<u32>>) {
+    for nodes in groups.values_mut() {
+        let mut keyed: Vec<(PathBuf, u32)> = nodes
+            .iter()
+            .map(|&idx| (node_path(tree, idx), idx))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        nodes.clear();
+        nodes.extend(keyed.iter().map(|&(_, idx)| idx));
+
+        let alloc = nodes
+            .iter()
+            .map(|&idx| tree.nodes[idx as usize].own_alloc)
+            .sum::<u64>();
+        for &idx in nodes.iter() {
+            tree.nodes[idx as usize].own_alloc = 0;
+        }
+        if let Some(&rep) = nodes.first() {
+            tree.nodes[rep as usize].own_alloc = alloc;
+        }
+    }
+}
+
+fn node_path(tree: &Tree, idx: u32) -> PathBuf {
+    let mut names = Vec::new();
+    let mut cur = idx;
+    while cur != tree.root {
+        let n = tree.node(cur);
+        if n.parent == u32::MAX {
+            break;
+        }
+        names.push(n.name.clone());
+        cur = n.parent;
+    }
+    let mut path = PathBuf::from(tree.node(tree.root).name.as_ref());
+    for name in names.iter().rev() {
+        path.push(name.as_ref());
+    }
+    path
 }
 
 fn worker(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<Msg>) {

@@ -126,13 +126,14 @@ pub fn write_json(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) -
         )?;
     }
     w.write_all(b"],\"tree\":")?;
-    node_json(w, &outcome.tree, outcome.tree.root)?;
+    write_tree_json(w, &outcome.tree)?;
     w.write_all(b"}\n")?;
     Ok(())
 }
 
-fn node_json(w: &mut dyn Write, t: &Tree, i: u32) -> io::Result<()> {
-    let n = &t.nodes[i as usize];
+/// ノードの共通部分を書き、子を持つ場合は `children` 配列を開く。
+/// 戻り値が true のとき、呼び出し側が `]}` で閉じる必要がある。
+fn write_json_node_prefix(w: &mut dyn Write, n: &crate::scan::node::Node) -> io::Result<bool> {
     let ty = match n.kind {
         NodeKind::Dir => "dir",
         NodeKind::File => "file",
@@ -161,15 +162,36 @@ fn node_json(w: &mut dyn Write, t: &Tree, i: u32) -> io::Result<()> {
     )?;
     if n.kind == NodeKind::Dir && !n.children.is_empty() {
         w.write_all(b",\"children\":[")?;
-        for (k, &c) in n.children.iter().enumerate() {
-            if k > 0 {
+        Ok(true)
+    } else {
+        w.write_all(b"}")?;
+        Ok(false)
+    }
+}
+
+/// JSON ツリーを明示的なスタックで preorder 出力する。
+/// 再帰を使わないため、深いツリーでもスタックオーバーフローしない。
+fn write_tree_json(w: &mut dyn Write, t: &Tree) -> io::Result<()> {
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    if write_json_node_prefix(w, t.node(t.root))? {
+        stack.push((t.root, 0));
+    }
+    while let Some(&(idx, next)) = stack.last() {
+        let children = &t.node(idx).children;
+        if next < children.len() {
+            let child = children[next];
+            stack.last_mut().expect("json stack").1 += 1;
+            if next > 0 {
                 w.write_all(b",")?;
             }
-            node_json(w, t, c)?;
+            if write_json_node_prefix(w, t.node(child))? {
+                stack.push((child, 0));
+            }
+        } else {
+            w.write_all(b"]}")?;
+            stack.pop();
         }
-        w.write_all(b"]")?;
     }
-    w.write_all(b"}")?;
     Ok(())
 }
 
@@ -229,25 +251,61 @@ pub fn write_csv(w: &mut dyn Write, outcome: &ScanOutcome, meta: &ReportMeta) ->
         w,
         "path,is_dir,allocated,logical,file_count,dir_count,error_count,truncated,cancelled,scan_truncated,scan_errors,allocated_collected,scan_blocked,schema_version"
     )?;
-    write_csv_node(
+    let tree = &outcome.tree;
+    let mut parts = vec![tree.node(tree.root).name.to_string_lossy().into_owned()];
+    write_csv_row(
         w,
-        &outcome.tree,
-        outcome.tree.root,
-        &mut Vec::new(),
+        tree,
+        tree.root,
+        &parts,
         meta.cancelled,
         meta.truncated,
         meta.errors,
         meta.allocated_collected,
         blocked,
-    )
+    )?;
+
+    // 再帰せず preorder で出力する。parts は現在のパスを表す。
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    if !tree.node(tree.root).children.is_empty() {
+        stack.push((tree.root, 0));
+    }
+    while let Some(&(idx, next)) = stack.last() {
+        let children = &tree.node(idx).children;
+        if next < children.len() {
+            let child = children[next];
+            stack.last_mut().expect("csv stack").1 += 1;
+            parts.push(tree.node(child).name.to_string_lossy().into_owned());
+            write_csv_row(
+                w,
+                tree,
+                child,
+                &parts,
+                meta.cancelled,
+                meta.truncated,
+                meta.errors,
+                meta.allocated_collected,
+                blocked,
+            )?;
+            if tree.node(child).children.is_empty() {
+                parts.pop();
+            } else {
+                stack.push((child, 0));
+            }
+        } else {
+            stack.pop();
+            parts.pop();
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_csv_node(
+fn write_csv_row(
     w: &mut dyn Write,
     t: &Tree,
     i: u32,
-    parts: &mut Vec<String>,
+    parts: &[String],
     cancelled: bool,
     scan_truncated: bool,
     scan_errors: u64,
@@ -255,8 +313,6 @@ fn write_csv_node(
     scan_blocked: u64,
 ) -> io::Result<()> {
     let n = &t.nodes[i as usize];
-    let name = n.name.to_string_lossy().into_owned();
-    parts.push(name);
     let sep = std::path::MAIN_SEPARATOR.to_string();
     let p = parts.join(&sep);
     writeln!(
@@ -276,24 +332,7 @@ fn write_csv_node(
         allocated_collected,
         scan_blocked,
         SCHEMA_VERSION,
-    )?;
-    let depth = parts.len();
-    for &c in &n.children {
-        write_csv_node(
-            w,
-            t,
-            c,
-            parts,
-            cancelled,
-            scan_truncated,
-            scan_errors,
-            allocated_collected,
-            scan_blocked,
-        )?;
-        parts.truncate(depth);
-    }
-    parts.pop();
-    Ok(())
+    )
 }
 
 /// UTC の ISO-8601 文字列。

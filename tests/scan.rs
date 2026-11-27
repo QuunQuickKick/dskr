@@ -42,6 +42,21 @@ fn child(out: &dskr::scan::ScanOutcome, name: &str) -> Option<u32> {
         .find(|&i| out.tree.node(i).name.to_string_lossy() == name)
 }
 
+#[cfg(unix)]
+fn find_path(out: &dskr::scan::ScanOutcome, names: &[&str]) -> Option<u32> {
+    let mut cur = out.tree.root;
+    for name in names {
+        cur = out
+            .tree
+            .node(cur)
+            .children
+            .iter()
+            .copied()
+            .find(|&i| out.tree.node(i).name.to_string_lossy() == *name)?;
+    }
+    Some(cur)
+}
+
 #[test]
 fn counts_and_sizes() {
     let dir = tempdir().unwrap();
@@ -83,6 +98,36 @@ fn hardlink_dedup() {
         2,
         "削除時の移し替え用に両方のノードを保持する"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlink_representative_is_deterministic() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().unwrap();
+    let d1 = dir.path().join("d1");
+    let d2 = dir.path().join("d2");
+    fs::create_dir_all(&d1).unwrap();
+    fs::create_dir_all(&d2).unwrap();
+    let f1 = d1.join("f");
+    let f2 = d2.join("g");
+    fs::write(&f1, vec![7u8; 64]).unwrap();
+    fs::hard_link(&f1, &f2).unwrap();
+    let blocks = fs::metadata(&f1).unwrap().blocks() * 512;
+
+    for _ in 0..5 {
+        let out = scan(dir.path(), cfg(dir.path()));
+        let n1 = find_path(&out, &["d1", "f"]).unwrap();
+        let n2 = find_path(&out, &["d2", "g"]).unwrap();
+        assert_eq!(
+            out.tree.node(n1).own_alloc,
+            blocks,
+            "辞書順で先の d1/f に allocated が集約される"
+        );
+        assert_eq!(out.tree.node(n2).own_alloc, 0);
+        assert_eq!(out.tree.node(out.tree.root).total_alloc, blocks);
+    }
 }
 
 #[test]
