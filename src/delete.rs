@@ -23,8 +23,13 @@ fn deletable_path(path: &Path) -> PathBuf {
 ///
 /// 走査時の ID と現在の ID が一致しない場合、どちらかが取得できない場合は
 /// エラーにする。確認ダイアログを開く前の事前チェックにも使う。
-pub fn check_target(path: &Path, kind: NodeKind, expected: FileId) -> Result<NodeKind, String> {
-    verify_target(path, kind, expected).map(|(kind, _)| kind)
+pub fn check_target(
+    path: &Path,
+    kind: NodeKind,
+    expected: FileId,
+    expected_link_like: bool,
+) -> Result<NodeKind, String> {
+    verify_target(path, kind, expected, expected_link_like).map(|(kind, _)| kind)
 }
 
 /// 対象を検証し、削除に使う種別とメタデータを返す。
@@ -35,6 +40,7 @@ fn verify_target(
     path: &Path,
     kind: NodeKind,
     expected: FileId,
+    expected_link_like: bool,
 ) -> Result<(NodeKind, fs::Metadata), String> {
     let fs_path = deletable_path(path);
     let md = fs::symlink_metadata(&fs_path).map_err(|e| {
@@ -55,6 +61,14 @@ fn verify_target(
     };
     if current != expected {
         return Err("走査時から対象が置き換わっています (削除を中止しました)".into());
+    }
+    if link_like != expected_link_like {
+        return Err(if link_like {
+            "対象がリンクに変わっています (削除を中止しました)"
+        } else {
+            "対象がリンクではなくなっています (削除を中止しました)"
+        }
+        .into());
     }
 
     // リンク・ジャンクションは、記録上の種別にかかわらずリンク自身だけを消す。
@@ -104,8 +118,13 @@ fn verify_target(
 /// 走査後に種類やファイル ID が変わっていた場合は、意図しない削除を避けるため
 /// エラーにする。ディレクトリは自身の ID だけを検証し、中身は削除実行時点の
 /// 状態を削除する。
-pub fn remove_target(path: &Path, kind: NodeKind, expected: FileId) -> Result<(), String> {
-    let (kind, md) = verify_target(path, kind, expected)?;
+pub fn remove_target(
+    path: &Path,
+    kind: NodeKind,
+    expected: FileId,
+    expected_link_like: bool,
+) -> Result<(), String> {
+    let (kind, md) = verify_target(path, kind, expected, expected_link_like)?;
     let fs_path = deletable_path(path);
     match kind {
         NodeKind::Dir => fs::remove_dir_all(&fs_path).map_err(|e| format!("削除に失敗: {e}")),
@@ -142,10 +161,11 @@ fn remove_link_or_leaf(path: &Path, md: &fs::Metadata) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn id_of(path: &Path) -> FileId {
+    fn id_of(path: &Path) -> (FileId, bool) {
         let md = fs::symlink_metadata(path).unwrap();
         let link_like = md.file_type().is_symlink() || platform::is_reparse_point(&md);
-        platform::file_id(&md, path, link_like).expect("ファイル ID を取得できる")
+        let id = platform::file_id(&md, path, link_like).expect("ファイル ID を取得できる");
+        (id, link_like)
     }
 
     #[test]
@@ -153,9 +173,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("victim.txt");
         fs::write(&file, b"x").unwrap();
-        let id = id_of(&file);
+        let (id, link_like) = id_of(&file);
 
-        remove_target(&file, NodeKind::File, id).unwrap();
+        remove_target(&file, NodeKind::File, id, link_like).unwrap();
         assert!(!file.exists());
     }
 
@@ -165,9 +185,9 @@ mod tests {
         let victim = dir.path().join("victim");
         fs::create_dir_all(victim.join("nested")).unwrap();
         fs::write(victim.join("nested").join("a.bin"), b"x").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
-        remove_target(&victim, NodeKind::Dir, id).unwrap();
+        remove_target(&victim, NodeKind::Dir, id, link_like).unwrap();
         assert!(!victim.exists());
     }
 
@@ -177,10 +197,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         fs::create_dir_all(&victim).unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
         fs::write(victim.join("added-after-scan.txt"), b"x").unwrap();
 
-        remove_target(&victim, NodeKind::Dir, id).unwrap();
+        remove_target(&victim, NodeKind::Dir, id, link_like).unwrap();
         assert!(!victim.exists());
     }
 
@@ -188,7 +208,7 @@ mod tests {
     fn missing_target_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.txt");
-        let err = remove_target(&missing, NodeKind::File, FileId::UNKNOWN).unwrap_err();
+        let err = remove_target(&missing, NodeKind::File, FileId::UNKNOWN, false).unwrap_err();
         assert!(err.contains("存在しません"), "{err}");
     }
 
@@ -198,9 +218,9 @@ mod tests {
         let victim = dir.path().join("victim");
         fs::create_dir_all(victim.join("nested")).unwrap();
         fs::write(victim.join("nested").join("a.bin"), b"x").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
-        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
         assert!(err.contains("フォルダ"), "{err}");
         assert!(victim.exists());
     }
@@ -216,9 +236,9 @@ mod tests {
         fs::write(target.join("keep.txt"), b"keep").unwrap();
         let link = dir.path().join("link");
         symlink(&target, &link).unwrap();
-        let id = id_of(&link);
+        let (id, link_like) = id_of(&link);
 
-        remove_target(&link, NodeKind::Other, id).unwrap();
+        remove_target(&link, NodeKind::Other, id, link_like).unwrap();
 
         assert!(!link.exists());
         assert!(target.exists());
@@ -230,9 +250,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"x").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
-        let err = remove_target(&victim, NodeKind::Dir, id).unwrap_err();
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like).unwrap_err();
         assert!(err.contains("フォルダではなく"), "{err}");
         assert!(victim.exists());
     }
@@ -247,9 +267,9 @@ mod tests {
         fs::write(&target, b"keep").unwrap();
         let link = dir.path().join("link");
         symlink(&target, &link).unwrap();
-        let id = id_of(&link);
+        let (id, link_like) = id_of(&link);
 
-        remove_target(&link, NodeKind::File, id).unwrap();
+        remove_target(&link, NodeKind::File, id, link_like).unwrap();
 
         assert!(!link.exists());
         assert!(target.exists());
@@ -264,9 +284,9 @@ mod tests {
         let victim = dir.path().join("victim");
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("a.bin"), b"x").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
-        let err = remove_target(&victim, NodeKind::Blocked, id).unwrap_err();
+        let err = remove_target(&victim, NodeKind::Blocked, id, link_like).unwrap_err();
         assert!(!err.is_empty(), "{err}");
         assert!(victim.exists());
     }
@@ -276,14 +296,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"old").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
         let replacement = dir.path().join("replacement.txt");
         fs::write(&replacement, b"new").unwrap();
         fs::remove_file(&victim).unwrap();
         fs::rename(&replacement, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
         assert_eq!(fs::read(&victim).unwrap(), b"new");
     }
@@ -293,9 +313,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"old").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
         // 確認ダイアログを開く時点の事前チェック。
-        check_target(&victim, NodeKind::File, id).unwrap();
+        check_target(&victim, NodeKind::File, id, link_like).unwrap();
 
         let replacement = dir.path().join("replacement.txt");
         fs::write(&replacement, b"new").unwrap();
@@ -303,7 +323,7 @@ mod tests {
         fs::rename(&replacement, &victim).unwrap();
 
         // 実際の削除時点では別ファイルになっている。
-        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
         assert_eq!(fs::read(&victim).unwrap(), b"new");
     }
@@ -316,15 +336,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"old").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
         let target = dir.path().join("target.txt");
         fs::write(&target, b"keep").unwrap();
         fs::remove_file(&victim).unwrap();
         symlink(&target, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
-        assert!(err.contains("置き換わっています"), "{err}");
+        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        assert!(
+            err.contains("リンクに変わっています") || err.contains("置き換わっています"),
+            "{err}"
+        );
         assert!(target.exists());
         assert!(fs::symlink_metadata(&victim)
             .unwrap()
@@ -342,7 +365,7 @@ mod tests {
         fs::write(&target, b"keep").unwrap();
         let victim = dir.path().join("victim.txt");
         symlink(&target, &victim).unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
         // 置き換え用ファイルを先に作り、inode の再利用を避ける。
         let replacement = dir.path().join("replacement.txt");
@@ -350,8 +373,11 @@ mod tests {
         fs::remove_file(&victim).unwrap();
         fs::rename(&replacement, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::Other, id).unwrap_err();
-        assert!(err.contains("置き換わっています"), "{err}");
+        let err = remove_target(&victim, NodeKind::Other, id, link_like).unwrap_err();
+        assert!(
+            err.contains("リンクではなくなっています") || err.contains("置き換わっています"),
+            "{err}"
+        );
         assert_eq!(fs::read(&victim).unwrap(), b"new");
     }
 
@@ -360,13 +386,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         fs::write(&victim, b"old").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
         fs::remove_file(&victim).unwrap();
         fs::create_dir(&victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
-        assert!(err.contains("置き換わっています"), "{err}");
+        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        assert!(
+            err.contains("フォルダに変わっています") || err.contains("置き換わっています"),
+            "{err}"
+        );
         assert!(victim.is_dir());
     }
 
@@ -375,7 +404,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         fs::create_dir(&victim).unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
         let replacement = dir.path().join("replacement");
         fs::create_dir(&replacement).unwrap();
@@ -383,7 +412,7 @@ mod tests {
         fs::remove_dir(&victim).unwrap();
         fs::rename(&replacement, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::Dir, id).unwrap_err();
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
         assert!(victim.join("keep.txt").exists());
     }
@@ -394,7 +423,7 @@ mod tests {
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"x").unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, FileId::UNKNOWN).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, FileId::UNKNOWN, false).unwrap_err();
         assert!(err.contains("走査時"), "{err}");
         assert!(victim.exists());
     }
@@ -406,9 +435,9 @@ mod tests {
         fs::write(&victim, b"x").unwrap();
         let twin = dir.path().join("twin.txt");
         fs::hard_link(&victim, &twin).unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
-        remove_target(&victim, NodeKind::File, id).unwrap();
+        remove_target(&victim, NodeKind::File, id, link_like).unwrap();
         assert!(!victim.exists());
         assert_eq!(fs::read(&twin).unwrap(), b"x");
     }
@@ -421,7 +450,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"old").unwrap();
-        let id = id_of(&victim);
+        let (id, link_like) = id_of(&victim);
 
         let target = dir.path().join("target.txt");
         fs::write(&target, b"keep").unwrap();
@@ -430,8 +459,11 @@ mod tests {
             return; // 開発者モード / 権限がない環境ではスキップ
         }
 
-        let err = remove_target(&victim, NodeKind::File, id).unwrap_err();
-        assert!(err.contains("置き換わっています"), "{err}");
+        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        assert!(
+            err.contains("リンクに変わっています") || err.contains("置き換わっています"),
+            "{err}"
+        );
         assert!(target.exists());
         assert!(fs::symlink_metadata(&victim)
             .unwrap()
@@ -455,9 +487,9 @@ mod tests {
         if !status.map(|s| s.success()).unwrap_or(false) {
             return; // ジャンクションを作れない環境ではスキップ
         }
-        let id = id_of(&link);
+        let (id, link_like) = id_of(&link);
 
-        remove_target(&link, NodeKind::Other, id).unwrap();
+        remove_target(&link, NodeKind::Other, id, link_like).unwrap();
         assert!(!link.exists());
         assert!(target.join("keep.txt").exists());
     }

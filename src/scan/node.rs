@@ -156,6 +156,8 @@ pub struct Tree {
     /// 削除時の同一性検証用のファイル ID。`--allow-delete` 時だけ設定する。
     /// 空のときは全ノードが `FileId::UNKNOWN` として扱われる。
     ids: Vec<FileId>,
+    /// 走査時にリンク / リパースポイントだったか。ID 再利用時の種類変更を検出する。
+    id_links: Vec<bool>,
 }
 
 impl Tree {
@@ -165,11 +167,12 @@ impl Tree {
             nodes: vec![root_node],
             root: 0,
             ids: Vec::new(),
+            id_links: Vec::new(),
         }
     }
 
     /// ノードの識別情報を記録する。`UNKNOWN` は記録しない。
-    pub fn set_id(&mut self, idx: u32, id: FileId) {
+    pub fn set_id(&mut self, idx: u32, id: FileId, link_like: bool) {
         if !id.is_known() {
             return;
         }
@@ -177,7 +180,11 @@ impl Tree {
         if i >= self.ids.len() {
             self.ids.resize(i + 1, FileId::UNKNOWN);
         }
+        if i >= self.id_links.len() {
+            self.id_links.resize(i + 1, false);
+        }
         self.ids[i] = id;
+        self.id_links[i] = link_like;
     }
 
     /// ノードの識別情報を返す。未収集・範囲外は `UNKNOWN`。
@@ -186,6 +193,11 @@ impl Tree {
             .get(idx as usize)
             .copied()
             .unwrap_or(FileId::UNKNOWN)
+    }
+
+    /// 走査時にリンク / リパースポイントだったか。未収集・範囲外は false。
+    pub fn id_link_like(&self, idx: u32) -> bool {
+        self.id_links.get(idx as usize).copied().unwrap_or(false)
     }
 
     pub fn node(&self, i: u32) -> &Node {
@@ -319,13 +331,19 @@ mod tests {
             volume: 1,
             index: 2,
         };
-        t.set_id(0, id);
+        t.set_id(0, id, false);
         assert_eq!(t.id(0), id);
+        assert!(!t.id_link_like(0));
         assert_eq!(t.id(99), FileId::UNKNOWN);
 
+        // リンク種別も記録する。
+        t.set_id(0, id, true);
+        assert!(t.id_link_like(0));
+
         // UNKNOWN は記録しない。
-        t.set_id(0, FileId::UNKNOWN);
+        t.set_id(0, FileId::UNKNOWN, false);
         assert_eq!(t.id(0), id);
+        assert!(t.id_link_like(0));
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub struct DeleteTarget {
     pub kind: NodeKind,
     /// 走査時に記録したファイル ID。削除直前に再照合する。
     pub expected: FileId,
+    /// 走査時にリンク / リパースポイントだったか。
+    pub expected_link_like: bool,
     pub bytes: u64,
     pub files: u64,
     pub dirs: u64,
@@ -356,7 +358,8 @@ impl App {
         );
         let path = self.path_of(idx);
         let expected = t.id(idx);
-        let kind = match delete::check_target(&path, recorded_kind, expected) {
+        let expected_link_like = t.id_link_like(idx);
+        let kind = match delete::check_target(&path, recorded_kind, expected, expected_link_like) {
             Ok(kind) => kind,
             Err(e) => {
                 self.message = Some(e);
@@ -377,6 +380,7 @@ impl App {
             path,
             kind,
             expected,
+            expected_link_like,
             bytes,
             files,
             dirs,
@@ -434,7 +438,12 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
-        match delete::remove_target(&target.path, target.kind, target.expected) {
+        match delete::remove_target(
+            &target.path,
+            target.kind,
+            target.expected,
+            target.expected_link_like,
+        ) {
             Ok(()) => {
                 if let Some(out) = self.outcome.as_mut() {
                     // 再帰削除するのは記録上 Dir のときだけ。リンクや Blocked は
@@ -982,7 +991,7 @@ mod tests {
         let mut tree = Tree::with_root(root.as_os_str().to_owned(), 0);
         if let Ok(md) = std::fs::symlink_metadata(root) {
             if let Some(id) = platform::file_id(&md, root, false) {
-                tree.set_id(0, id);
+                tree.set_id(0, id, false);
             }
         }
         let mut entries: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
@@ -998,7 +1007,7 @@ mod tests {
                     .push_child_capped(0, Node::dir(name, 0, 1, 0), 100)
                     .unwrap();
                 if let Some(id) = id {
-                    tree.set_id(d, id);
+                    tree.set_id(d, id, link_like);
                 }
                 for child in std::fs::read_dir(&path).unwrap().flatten() {
                     let child_path = child.path();
@@ -1009,7 +1018,7 @@ mod tests {
                     let n = Node::file(child.file_name(), d, 2, cmd.len(), cmd.len(), 0);
                     let ci = tree.push_child_capped(d, n, 100).unwrap();
                     if let Some(cid) = cid {
-                        tree.set_id(ci, cid);
+                        tree.set_id(ci, cid, child_link);
                     }
                 }
             } else {
@@ -1017,7 +1026,7 @@ mod tests {
                     .push_child_capped(0, Node::file(name, 0, 1, md.len(), md.len(), 0), 100)
                     .unwrap();
                 if let Some(id) = id {
-                    tree.set_id(idx, id);
+                    tree.set_id(idx, id, link_like);
                 }
             }
         }
@@ -1109,7 +1118,7 @@ mod tests {
         .unwrap();
         tree.aggregate();
         let md = std::fs::symlink_metadata(&link).unwrap();
-        tree.set_id(link_idx, platform::file_id(&md, &link, true).unwrap());
+        tree.set_id(link_idx, platform::file_id(&md, &link, true).unwrap(), true);
 
         let mut app = test_app_at(dir.path(), true);
         app.finish(ScanOutcome {
@@ -1168,7 +1177,7 @@ mod tests {
         tree.aggregate();
         for (idx, path) in [(n1, &f1), (n2, &f2)] {
             let md = std::fs::symlink_metadata(path).unwrap();
-            tree.set_id(idx, platform::file_id(&md, path, false).unwrap());
+            tree.set_id(idx, platform::file_id(&md, path, false).unwrap(), false);
         }
 
         let mut groups = HashMap::new();
@@ -1240,7 +1249,7 @@ mod tests {
             (&outside_idx, &outside),
         ] {
             let md = std::fs::symlink_metadata(path).unwrap();
-            tree.set_id(*idx, platform::file_id(&md, path, false).unwrap());
+            tree.set_id(*idx, platform::file_id(&md, path, false).unwrap(), false);
         }
 
         let mut groups = HashMap::new();
@@ -1266,6 +1275,7 @@ mod tests {
             path: sub.clone(),
             kind: NodeKind::Dir,
             expected: app.tree().unwrap().id(sub_idx),
+            expected_link_like: false,
             bytes: 100,
             files: 1,
             dirs: 0,

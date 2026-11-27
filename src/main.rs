@@ -29,7 +29,7 @@ use dskr::sort::{SortDir, SortField, SortSpec};
 use dskr::ui;
 
 enum ScanMsg {
-    Done(dskr::scan::ScanOutcome),
+    Done(Box<dskr::scan::ScanOutcome>),
     Failed(String),
 }
 
@@ -512,7 +512,7 @@ fn run_tui(p: TuiParams) -> Result<(u32, bool), String> {
                     run(cfg, progress, control)
                 }));
                 let msg = match result {
-                    Ok(out) => ScanMsg::Done(out),
+                    Ok(out) => ScanMsg::Done(Box::new(out)),
                     Err(_) => {
                         ScanMsg::Failed("内部エラー: 走査スレッドが異常終了しました".to_string())
                     }
@@ -552,7 +552,7 @@ fn run_tui(p: TuiParams) -> Result<(u32, bool), String> {
         }
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                ScanMsg::Done(out) => app.finish(out),
+                ScanMsg::Done(out) => app.finish(*out),
                 ScanMsg::Failed(m) => app.fail(m),
             }
         }

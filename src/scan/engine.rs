@@ -197,7 +197,13 @@ pub struct ScanOutcome {
     pub root: PathBuf,
 }
 
-type PendingNode = (Node, Option<(u64, u64)>, FileId);
+type PendingNode = (Node, Option<(u64, u64)>, Option<NodeIdentity>);
+
+#[derive(Clone, Copy)]
+struct NodeIdentity {
+    id: FileId,
+    link_like: bool,
+}
 
 enum Msg {
     Dir {
@@ -329,7 +335,7 @@ pub fn run(cfg: EngineConfig, progress: Arc<Progress>, control: Arc<Control>) ->
     if cfg.want_identity {
         if let Some(md) = &root_md {
             if let Some(id) = platform::file_id(md, &fs_root, false) {
-                initial_tree.set_id(0, id);
+                initial_tree.set_id(0, id, false);
             }
         }
     }
@@ -772,7 +778,7 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
                         depth + 1,
                         &tmd,
                         &child_path,
-                        Some(link_id),
+                        link_id,
                     );
                 }
                 Err(e) => {
@@ -788,11 +794,13 @@ fn process_dir(sh: &Arc<Shared>, path: PathBuf, node: u32, depth: u16) {
         let mut links: Vec<(u32, (u64, u64))> = Vec::new();
         {
             let mut t = lock(&sh.tree);
-            for (n, hardlink, id) in batch {
+            for (n, hardlink, identity) in batch {
                 match sh.push_locked(&mut t, node, n) {
                     Some(idx) => {
-                        if id.is_known() {
-                            t.set_id(idx, id);
+                        if let Some(identity) = identity {
+                            if identity.id.is_known() {
+                                t.set_id(idx, identity.id, identity.link_like);
+                            }
                         }
                         if let Some(key) = hardlink {
                             links.push((idx, key));
@@ -890,12 +898,12 @@ impl Shared {
         !(self.cfg.network && cfg!(windows))
     }
 
-    /// 削除時の同一性検証用 ID。要求されていない場合は `UNKNOWN`。
-    fn identity(&self, md: &Metadata, path: &Path, link_like: bool) -> FileId {
+    /// 削除時の同一性検証用 ID。要求されていない場合は None。
+    fn identity(&self, md: &Metadata, path: &Path, link_like: bool) -> Option<NodeIdentity> {
         if !self.cfg.want_identity {
-            return FileId::UNKNOWN;
+            return None;
         }
-        platform::file_id(md, path, link_like).unwrap_or(FileId::UNKNOWN)
+        platform::file_id(md, path, link_like).map(|id| NodeIdentity { id, link_like })
     }
 
     /// ファイルノードをバッチへ追加する。min_size とクラウドプレースホルダ
@@ -910,7 +918,7 @@ impl Shared {
         depth: u16,
         md: &Metadata,
         path: &Path,
-        id_override: Option<FileId>,
+        id_override: Option<NodeIdentity>,
     ) -> bool {
         let logical = md.len();
         if logical < self.cfg.min_size {
@@ -950,7 +958,12 @@ impl Shared {
             }
             None => info.alloc,
         };
-        let id = id_override.or(info.id).unwrap_or(FileId::UNKNOWN);
+        let identity = id_override.or_else(|| {
+            info.id.map(|id| NodeIdentity {
+                id,
+                link_like: false,
+            })
+        });
         batch.push((
             Node::file(
                 name,
@@ -961,7 +974,7 @@ impl Shared {
                 platform::mtime_secs(md),
             ),
             info.hardlink,
-            id,
+            identity,
         ));
         self.progress
             .bytes_alloc
@@ -981,14 +994,16 @@ impl Shared {
         path: PathBuf,
         depth: u16,
         mtime: i64,
-        id: FileId,
+        identity: Option<NodeIdentity>,
     ) -> bool {
         let idx = {
             let mut t = lock(&self.tree);
             match self.push_locked(&mut t, parent, Node::dir(name, parent, depth, mtime)) {
                 Some(i) => {
-                    if id.is_known() {
-                        t.set_id(i, id);
+                    if let Some(identity) = identity {
+                        if identity.id.is_known() {
+                            t.set_id(i, identity.id, identity.link_like);
+                        }
                     }
                     i
                 }

@@ -702,4 +702,8 @@ fn followed_link_records_link_identity_not_target() {
         link_id,
         "削除時の同一性はリンク自身で確認する"
     );
+    assert!(
+        out.tree.id_link_like(link_idx),
+        "走査時のリンク種別も保持する"
+    );
 }
