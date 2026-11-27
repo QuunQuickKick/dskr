@@ -69,8 +69,9 @@ tool_bin() {
 
 tool_version() {
     local cmd=$1
-    # shellcheck disable=SC2086
-    $cmd --version 2>/dev/null | head -1 || true
+    local bin
+    bin=$(tool_bin "$cmd")
+    "$bin" --version 2>/dev/null | head -1 || true
 }
 
 print_metadata() {
