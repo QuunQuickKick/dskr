@@ -79,6 +79,12 @@ aarch64 + x86_64 の universal2 tar.gz を作る。Xcode Command Line Tools と
   ネットワークマウントと Unknown のファイルシステムでは収集しない。
   Windows 11 ローカル NTFS の通常ファイルは同一ハンドルで ID・属性・
   ハードリンク数・ファイルシステムを再検証してから disposition を設定する。
+  ファイルシンボリックリンク / ディレクトリシンボリックリンク / ジャンクションも、
+  `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` でリンク自身の
+  ハンドルを開き、ID・再解析タグ・DIRECTORY 属性・READONLY・ハードリンク数・
+  NTFS を同じハンドルで検証してから disposition を設定する。対応タグは
+  `IO_REPARSE_TAG_SYMLINK` と `IO_REPARSE_TAG_MOUNT_POINT` (DIRECTORY あり)
+  だけで、失敗時に path-based 削除へフォールバックしない。
 
 ## テストの注意点
 

@@ -391,8 +391,11 @@ impl App {
                 return;
             }
         };
-        // リンク先の中身をツリーに持つリンクを消すと、リンク先が別のパスに
-        // 残っている場合に合計がずれる。安全のため削除を拒否する。
+        // Windows 11 のリンクはハンドルベースでリンク自身だけを削除できる。
+        // --follow-links で子を持つリンクノードも、リンク先ではなくリンクを
+        // 消す。ツリーからはリンクノードだけを外し、子ノードは削除しない。
+        // それ以外の環境では、従来どおり集計ずれを避けるため拒否する。
+        #[cfg(not(windows))]
         if kind == NodeKind::Other && !n.children.is_empty() {
             self.message = Some(
                 "--follow-links で辿ったリンクは削除できません (リンク先を直接開いてください)"
@@ -1149,6 +1152,66 @@ mod tests {
             app.path_of(file_idx),
             dir.path().join("victim").join("a.bin")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deleting_followed_windows_symlink_removes_link_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside"), b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::windows::fs::symlink_dir(&target, &link)
+            .expect("ディレクトリシンボリックリンクを作成できる");
+
+        let mut tree = Tree::with_root(dir.path().as_os_str().to_owned(), 0);
+        let link_idx = tree
+            .push_child_capped(0, Node::dir("link".into(), 0, 1, 0), 100)
+            .unwrap();
+        tree.push_child_capped(
+            link_idx,
+            Node::file("inside".into(), link_idx, 2, 10, 1, 0),
+            100,
+        )
+        .unwrap();
+        tree.aggregate();
+        let md = std::fs::symlink_metadata(&link).unwrap();
+        tree.set_id(link_idx, platform::file_id(&md, &link, true).unwrap(), true);
+
+        let mut app = test_app_at(dir.path(), true);
+        app.finish(ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: 2,
+            dirs: 1,
+            error_count: 0,
+            bytes_alloc: 10,
+            bytes_logical: 1,
+            elapsed: Duration::from_millis(1),
+            root: dir.path().to_path_buf(),
+        });
+
+        app.sel = app
+            .listing
+            .iter()
+            .position(|&i| app.tree().unwrap().node(i).name.to_string_lossy() == "link")
+            .unwrap();
+        app.begin_delete();
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+        app.perform_delete();
+
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(target.is_dir());
+        assert!(target.join("inside").exists());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("削除しました"));
     }
 
     #[cfg(unix)]

@@ -73,8 +73,10 @@ dskr の合計は、ファイルとリンクのサイズを中心に集計しま
 - `--follow-links` を指定すると、同一ボリューム内のリンク先を辿ります。
 - ループや同一ディレクトリの重複は検出し、1回だけ集計します。
 - `-x` / `--local-only` 指定時はリンクを辿りません。
-- `--follow-links` で中身を辿ったリンクは、削除すると集計がずれるため
-  TUI からの削除を拒否します。リンク先を直接開いて削除してください。
+- Windows 11 のローカル NTFS では、`--follow-links` で中身を辿ったリンク
+  ノードも、リンク自身だけを TUI から削除できます。リンク先のファイル・
+  ディレクトリ・内容は削除しません。Windows 以外では、従来どおり集計ずれを
+  避けるため TUI からの削除を拒否します。
 
 ## 5. スパース・圧縮・clone / reflink
 
@@ -199,6 +201,11 @@ CSV の各行:
 これらの変更は、数値の意味が変わるため、将来変更する場合はマイナーバージョン
 アップとして扱います。
 
+> この表は 0.3.0 時点の履歴です。現在は Windows 11 のローカル NTFS に限り、
+> `--follow-links` で辿ったリンクノードもリンク自身だけを削除できます。
+> Windows 以外では 0.3.0 と同じく拒否します。詳細は「15. 削除時の同一性検証」を
+> 参照してください。
+
 ## 14. 0.4.0 の変更
 
 - JSON / CSV の出力処理を反復化しました。出力順・スキーマは変わりません。
@@ -275,10 +282,58 @@ Windows 11 のローカル NTFS 上の通常ファイルは、`CreateFileW` で�
 拒否し、path-based 削除へフォールバックしません。disposition 成功後の
 `CloseHandle` 失敗は、削除指示成功・ハンドル解放状態不明として区別します。
 
-Windows 11 のこの経路は、ハードリンク、読み取り専用、リンク / 再解析ポイント、
+通常ファイル経路は、ハードリンク、読み取り専用、リンク / 再解析ポイント、
 ディレクトリ、NTFS 以外を対象外とします。Windows 10、ReFS、FAT / exFAT、
-UNC / ネットワーク FS は未検証です。Windows のディレクトリ・リンクなど
-Phase 2-B の対象外は従来の path-based 経路を維持します。
+UNC / ネットワーク FS は未検証です。Windows の通常ディレクトリ、および
+Windows 以外のリンクは従来の path-based 経路を維持します。
+
+### Windows 11 のリンク / ジャンクションのハンドルベース削除
+
+Windows 11 のローカル NTFS 上のファイルシンボリックリンク、
+ディレクトリシンボリックリンク、ジャンクションは、リンク自身の削除用
+ハンドルを開き、同じハンドルで検証してから
+`SetFileInformationByHandle(FileDispositionInfo)` を実行します。リンク先は
+開きません。
+
+ハンドルは次の条件で開きます。
+
+- `DELETE` のみ
+- `FILE_SHARE_READ | FILE_SHARE_WRITE`
+- `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`
+- `FILE_FLAG_DELETE_ON_CLOSE` なし
+
+同じハンドルで以下を検証します。
+
+- 走査時の 64-bit FileId (volume serial + file index) と一致
+- `FILE_ATTRIBUTE_REPARSE_POINT` がある
+- 再解析タグと `FILE_ATTRIBUTE_DIRECTORY` の組み合わせが次のいずれか
+  - `IO_REPARSE_TAG_SYMLINK` + DIRECTORY なし (ファイルシンボリックリンク)
+  - `IO_REPARSE_TAG_SYMLINK` + DIRECTORY あり (ディレクトリシンボリックリンク)
+  - `IO_REPARSE_TAG_MOUNT_POINT` + DIRECTORY あり (ジャンクション)
+- `FILE_ATTRIBUTE_READONLY` がない
+- `nNumberOfLinks == 1`
+- ファイルシステム名が `NTFS`
+- `--follow-links` で `File` / `Dir` として記録されたリンクは、走査時の種別と
+  `FILE_ATTRIBUTE_DIRECTORY` が一致する (`NodeKind::Other` のリンクは
+  ファイルリンク / ディレクトリリンク / ジャンクションのいずれかを許可)
+
+`IO_REPARSE_TAG_SYMLINK` / `IO_REPARSE_TAG_MOUNT_POINT` 以外のタグ、
+DIRECTORY 属性が一致しない組み合わせ、ハードリンク数が 1 でないリンク、
+READONLY のリンク、NTFS 以外のリンクは拒否します。OneDrive プレースホルダ等の
+未知の再解析ポイントも拒否します。
+
+ハンドル取得、情報取得、検証、disposition のいずれかが失敗した場合は削除を
+拒否し、`DeleteFileW` / `RemoveDirectoryW` などの path-based 削除へ
+フォールバックしません。disposition 成功後の `CloseHandle` 失敗は、
+削除指示成功・ハンドル解放状態不明として区別します。
+
+`IO_REPARSE_TAG_MOUNT_POINT` は DIRECTORY 属性ありのジャンクションとして
+扱います。ボリューム マウント ポイントは個別に検証していません。削除するのは
+再解析ポイント自身で、リンク先のボリュームや内容は削除しません。
+
+Windows 10、ReFS、FAT / exFAT、UNC / ネットワーク FS は未検証です。
+Windows のリンクとして記録されていない特殊ファイルは、従来の path-based
+経路を維持します。
 
 ### ディレクトリ削除の範囲
 
@@ -291,15 +346,16 @@ Phase 2-B の対象外は従来の path-based 経路を維持します。
 ファイル ID の検証と実際の削除は別の操作です。検証後、削除するまでの間に
 対象が置き換わる可能性は完全には排除できません。
 
-Windows 11 のローカル NTFS 通常ファイルでは、`CreateFileW` で開いた同一
-ハンドルに対して ID 検証と `SetFileInformationByHandle` を行うため、開いた
-後のパス再解決による置き換えは防げます。ただし、走査時からハンドルを開く
-までの間に FileId が再利用された場合は、ID の一致だけでは検出できません。
+Windows 11 のローカル NTFS 通常ファイルとリンク / ジャンクションでは、
+`CreateFileW` で開いた同一ハンドルに対して ID 検証と
+`SetFileInformationByHandle` を行うため、開いた後のパス再解決による
+置き換えは防げます。ただし、走査時からハンドルを開くまでの間に FileId が
+再利用された場合は、ID の一致だけでは検出できません。
 
 Unix には移植性のある「ID を比較してから同じ対象を原子的に unlink する」
-API がありません。Windows のディレクトリ・再帰削除・リンクなど Phase 2-B の
-対象外もパスベースです。これらは検証直後に削除することで競合窓を最小化し、
-リンクを辿らない `remove_dir_all` と組み合わせてリスクを下げています。
+API がありません。Windows のディレクトリ・再帰削除・リンクとして記録されて
+いない特殊ファイルもパスベースです。これらは検証直後に削除することで競合窓を
+最小化し、リンクを辿らない `remove_dir_all` と組み合わせてリスクを下げています。
 
 また、OS が削除直後に同じ inode / file index を再利用した場合、ID の比較だけでは
 新しいファイルと元のファイルを区別できません。リンク種別やファイル種別が変わった

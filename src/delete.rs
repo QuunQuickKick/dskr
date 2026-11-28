@@ -15,11 +15,19 @@ use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileDispositionInfo, GetFileInformationByHandle, GetVolumeInformationByHandleW,
-    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
+
+/// 再解析タグ。windows-sys の追加 feature を要求しないよう局所定義する。
+#[cfg(windows)]
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+#[cfg(windows)]
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
 /// Windows の長いパスでも削除できるように変換する。
 fn deletable_path(path: &Path) -> PathBuf {
@@ -142,7 +150,16 @@ pub fn remove_target(
     expected: FileId,
     expected_link_like: bool,
 ) -> Result<(), String> {
+    #[cfg(windows)]
+    let recorded_kind = kind;
     let (kind, md) = verify_target(path, kind, expected, expected_link_like)?;
+
+    // Phase 2-C: Windows のリンク / ジャンクションは、リンク自身の
+    // ハンドルを開いて検証・削除する。リンク先は開かない。
+    #[cfg(windows)]
+    if expected_link_like {
+        return remove_link_by_handle(path, expected, recorded_kind);
+    }
 
     // Phase 2-B: Windows の通常ファイルだけをハンドルベースで削除する。
     // 対象外の種別は従来の削除経路を維持する。
@@ -372,6 +389,191 @@ fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(code) => Err(format!(
             "削除指示は成功しましたが、ハンドルの解放に失敗しました。ファイルの状態を確認できません: {}",
+            windows_error(code)
+        )),
+    }
+}
+
+/// Windows ローカル NTFS のリンク / ジャンクションの検証。
+///
+/// 走査時の `NodeKind::Other` はファイルリンク・ディレクトリリンク・
+/// ジャンクションをまとめて表すため、再解析タグと DIRECTORY 属性の
+/// 組み合わせが次のいずれかであることを確認する。
+///
+/// - `IO_REPARSE_TAG_SYMLINK` + DIRECTORY なし (ファイルリンク)
+/// - `IO_REPARSE_TAG_SYMLINK` + DIRECTORY あり (ディレクトリリンク)
+/// - `IO_REPARSE_TAG_MOUNT_POINT` + DIRECTORY あり (ジャンクション)
+///
+/// それ以外のタグや組み合わせは、OneDrive プレースホルダ等の未知の
+/// 再解析ポイントとして拒否する。
+#[cfg(windows)]
+fn validate_link_handle_info(
+    info: &BY_HANDLE_FILE_INFORMATION,
+    tag: &FILE_ATTRIBUTE_TAG_INFO,
+    expected: FileId,
+    fs_name: &str,
+    recorded_kind: NodeKind,
+) -> Result<(), String> {
+    if !expected.is_known() {
+        return Err(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
+                .into(),
+        );
+    }
+
+    let volume = info.dwVolumeSerialNumber as u64;
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    if volume != expected.volume || index != expected.index {
+        return Err("走査時から対象が置き換わっています (削除を中止しました)".into());
+    }
+
+    let info_reparse = info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    let tag_reparse = tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    if !info_reparse || !tag_reparse {
+        return Err("対象がリンク / 再解析ポイントではないため、削除を中止しました".into());
+    }
+
+    let info_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let tag_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if info_directory != tag_directory {
+        return Err("リンクの DIRECTORY 属性が一致しないため、削除を中止しました".into());
+    }
+
+    // `NodeKind::Other` はファイルリンク・ディレクトリリンク・ジャンクションを
+    // まとめて表すため、DIRECTORY 属性の期待値を固定しない。`--follow-links`
+    // で File / Dir として記録されたリンクは、走査時の種別と矛盾しないことを
+    // 追加で確認する。
+    let expected_directory = match recorded_kind {
+        NodeKind::File => Some(false),
+        NodeKind::Dir => Some(true),
+        NodeKind::Other | NodeKind::Blocked => None,
+    };
+    if expected_directory.is_some_and(|expected| expected != info_directory) {
+        return Err(
+            "走査時の種別とリンクの DIRECTORY 属性が一致しないため、削除を中止しました".into(),
+        );
+    }
+
+    if info.dwFileAttributes & FILE_ATTRIBUTE_READONLY != 0
+        || tag.FileAttributes & FILE_ATTRIBUTE_READONLY != 0
+    {
+        return Err("読み取り専用のリンクは削除できません (属性は変更しません)".into());
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(format!(
+            "ハードリンク数が {} のリンクは削除できません",
+            info.nNumberOfLinks
+        ));
+    }
+    if !fs_name.eq_ignore_ascii_case("NTFS") {
+        return Err(format!(
+            "NTFS以外のファイルシステム上のリンクは削除できません: {fs_name}"
+        ));
+    }
+
+    match tag.ReparseTag {
+        IO_REPARSE_TAG_SYMLINK => {
+            // ファイルリンク / ディレクトリリンクの両方を許可する。
+            // DIRECTORY 属性とタグ属性の一致は上で確認済み。
+        }
+        IO_REPARSE_TAG_MOUNT_POINT => {
+            if !info_directory {
+                return Err("ジャンクションの DIRECTORY 属性がないため、削除を中止しました".into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "未対応の再解析ポイント (タグ {other:#010x}) のため、削除を中止しました"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Windows ローカル NTFS のリンク / ジャンクションを、リンク自身の
+/// 同一ハンドルで検証して削除する。
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` によりリンク先は開かない。
+/// `FILE_FLAG_BACKUP_SEMANTICS` はディレクトリリンク / ジャンクションの
+/// ハンドル取得に必要。`CreateFileW` 失敗時も検証失敗時も、
+/// path-based 削除へはフォールバックしない。
+#[cfg(windows)]
+fn remove_link_by_handle(
+    path: &Path,
+    expected: FileId,
+    recorded_kind: NodeKind,
+) -> Result<(), String> {
+    if !expected.is_known() {
+        return Err(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
+                .into(),
+        );
+    }
+
+    let fs_path = deletable_path(path);
+    let wide = to_wide(&fs_path);
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(format!(
+            "リンクの削除用ハンドルを取得できないため、削除を中止しました: {}",
+            windows_error(last_error())
+        ));
+    }
+    let mut handle = DeleteHandle::new(raw);
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.raw(), &mut info) } == 0 {
+        return Err(format!(
+            "リンクのファイル情報を取得できないため、削除を中止しました: {}",
+            windows_error(last_error())
+        ));
+    }
+
+    let mut tag: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileAttributeTagInfo,
+            &mut tag as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "リンクの再解析情報を取得できないため、削除を中止しました: {}",
+            windows_error(last_error())
+        ));
+    }
+
+    let fs_name = volume_fs_name(handle.raw())?;
+    validate_link_handle_info(&info, &tag, expected, &fs_name, recorded_kind)?;
+
+    if let Err(code) = set_delete_disposition(handle.raw()) {
+        let close = handle.close();
+        let mut message = format!("リンクの削除指示に失敗しました: {}", windows_error(code));
+        if let Err(close_code) = close {
+            message.push_str(&format!(
+                " / ハンドルの解放にも失敗しました: {}",
+                windows_error(close_code)
+            ));
+        }
+        return Err(message);
+    }
+
+    match handle.close() {
+        Ok(()) => Ok(()),
+        Err(code) => Err(format!(
+            "リンクの削除指示は成功しましたが、ハンドルの解放に失敗しました。リンクの状態を確認できません: {}",
             windows_error(code)
         )),
     }
@@ -711,9 +913,7 @@ mod tests {
         let target = dir.path().join("target.txt");
         fs::write(&target, b"keep").unwrap();
         fs::remove_file(&victim).unwrap();
-        if symlink_file(&target, &victim).is_err() {
-            return; // 開発者モード / 権限がない環境ではスキップ
-        }
+        symlink_file(&target, &victim).expect("置き換え用のファイルシンボリックリンクを作成できる");
 
         let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
         assert!(
@@ -739,14 +939,13 @@ mod tests {
             .args(["/C", "mklink", "/J"])
             .arg(&link)
             .arg(&target)
-            .status();
-        if !status.map(|s| s.success()).unwrap_or(false) {
-            return; // ジャンクションを作れない環境ではスキップ
-        }
+            .status()
+            .expect("mklink /J を起動できる");
+        assert!(status.success(), "ジャンクションを作成できません");
         let (id, link_like) = id_of(&link);
 
         remove_target(&link, NodeKind::Other, id, link_like).unwrap();
-        assert!(!link.exists());
+        assert!(fs::symlink_metadata(&link).is_err());
         assert!(target.join("keep.txt").exists());
     }
 
@@ -754,6 +953,117 @@ mod tests {
     mod windows_handle_tests {
         use super::*;
         use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateHardLinkW, FileBasicInfo, FILE_ATTRIBUTE_ARCHIVE, FILE_BASIC_INFO,
+            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        };
+
+        fn create_file_symlink(target: &Path, link: &Path) {
+            std::os::windows::fs::symlink_file(target, link)
+                .unwrap_or_else(|e| panic!("ファイルシンボリックリンクを作成できません: {e}"));
+        }
+
+        fn create_dir_symlink(target: &Path, link: &Path) {
+            std::os::windows::fs::symlink_dir(target, link)
+                .unwrap_or_else(|e| panic!("ディレクトリシンボリックリンクを作成できません: {e}"));
+        }
+
+        fn create_junction(target: &Path, link: &Path) {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .expect("mklink /J を起動できる");
+            assert!(status.success(), "ジャンクションを作成できません");
+        }
+
+        fn link_info(
+            id: FileId,
+            directory: bool,
+            readonly: bool,
+            links: u32,
+        ) -> BY_HANDLE_FILE_INFORMATION {
+            let mut info = info_for(id);
+            info.dwFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT;
+            if directory {
+                info.dwFileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
+            }
+            if readonly {
+                info.dwFileAttributes |= FILE_ATTRIBUTE_READONLY;
+            }
+            info.nNumberOfLinks = links;
+            info
+        }
+
+        fn link_tag(tag: u32, directory: bool, readonly: bool) -> FILE_ATTRIBUTE_TAG_INFO {
+            let mut attrs = FILE_ATTRIBUTE_REPARSE_POINT;
+            if directory {
+                attrs |= FILE_ATTRIBUTE_DIRECTORY;
+            }
+            if readonly {
+                attrs |= FILE_ATTRIBUTE_READONLY;
+            }
+            FILE_ATTRIBUTE_TAG_INFO {
+                FileAttributes: attrs,
+                ReparseTag: tag,
+            }
+        }
+
+        fn set_link_readonly(path: &Path, readonly: bool) -> Result<(), String> {
+            let raw = unsafe {
+                CreateFileW(
+                    to_wide(path).as_ptr(),
+                    FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(
+                raw != INVALID_HANDLE_VALUE && !raw.is_null(),
+                "属性用ハンドルを取得できません: {}",
+                windows_error(last_error())
+            );
+            let mut handle = DeleteHandle::new(raw);
+            let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    handle.raw(),
+                    FileBasicInfo,
+                    &mut info as *mut _ as *mut c_void,
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(format!(
+                    "リンク属性を取得できません: {}",
+                    windows_error(last_error())
+                ));
+            }
+            if readonly {
+                info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+            } else {
+                info.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+            }
+            let ok = unsafe {
+                SetFileInformationByHandle(
+                    handle.raw(),
+                    FileBasicInfo,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(format!(
+                    "リンク属性を設定できません: {}",
+                    windows_error(last_error())
+                ));
+            }
+            handle.close().map_err(windows_error)
+        }
 
         fn info_for(id: FileId) -> BY_HANDLE_FILE_INFORMATION {
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -936,6 +1246,316 @@ mod tests {
             unsafe {
                 let _ = CloseHandle(lock);
             }
+        }
+
+        #[test]
+        fn delete_handle_close_is_single_shot() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("handle.txt");
+            fs::write(&file, b"x").unwrap();
+            let raw = unsafe {
+                CreateFileW(
+                    to_wide(&file).as_ptr(),
+                    DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(raw != INVALID_HANDLE_VALUE && !raw.is_null());
+            let mut handle = DeleteHandle::new(raw);
+            handle.close().unwrap();
+            // 明示 close 後の Drop は再試行しない。2 回目の close も成功扱い。
+            handle.close().unwrap();
+            assert!(file.exists());
+        }
+
+        #[test]
+        fn link_validation_accepts_supported_combinations() {
+            for (directory, tag) in [
+                (false, IO_REPARSE_TAG_SYMLINK),
+                (true, IO_REPARSE_TAG_SYMLINK),
+                (true, IO_REPARSE_TAG_MOUNT_POINT),
+            ] {
+                let info = link_info(id(), directory, false, 1);
+                let tag = link_tag(tag, directory, false);
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other).unwrap();
+            }
+
+            // --follow-links で File / Dir として記録されたリンクは、
+            // 走査時の種別と DIRECTORY 属性が一致する必要がある。
+            let info = link_info(id(), false, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, false);
+            validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::File).unwrap();
+            let info = link_info(id(), true, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, true, false);
+            validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Dir).unwrap();
+        }
+
+        #[test]
+        fn link_validation_rejects_mount_point_without_directory() {
+            let info = link_info(id(), false, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_MOUNT_POINT, false, false);
+            let err =
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other).unwrap_err();
+            assert!(err.contains("DIRECTORY"), "{err}");
+        }
+
+        #[test]
+        fn link_validation_rejects_unknown_tag() {
+            let info = link_info(id(), true, false, 1);
+            let tag = link_tag(0x9000_001A, true, false);
+            let err =
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other).unwrap_err();
+            assert!(err.contains("未対応の再解析ポイント"), "{err}");
+        }
+
+        #[test]
+        fn link_validation_rejects_missing_reparse_point() {
+            let mut info = link_info(id(), false, false, 1);
+            info.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+            let tag = FILE_ATTRIBUTE_TAG_INFO {
+                FileAttributes: FILE_ATTRIBUTE_ARCHIVE,
+                ReparseTag: IO_REPARSE_TAG_SYMLINK,
+            };
+            let err =
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other).unwrap_err();
+            assert!(err.contains("リンク"), "{err}");
+        }
+
+        #[test]
+        fn link_validation_rejects_directory_attribute_mismatch() {
+            let info = link_info(id(), true, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, false);
+            let err =
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other).unwrap_err();
+            assert!(err.contains("DIRECTORY"), "{err}");
+
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, true, false);
+            let err =
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::File).unwrap_err();
+            assert!(err.contains("走査時の種別"), "{err}");
+            let info = link_info(id(), false, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, false);
+            let err =
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Dir).unwrap_err();
+            assert!(err.contains("走査時の種別"), "{err}");
+        }
+
+        #[test]
+        fn link_validation_rejects_readonly_hardlink_and_non_ntfs() {
+            let info = link_info(id(), false, true, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, true);
+            assert!(
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other)
+                    .unwrap_err()
+                    .contains("読み取り専用")
+            );
+
+            let info = link_info(id(), false, false, 2);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, false);
+            assert!(
+                validate_link_handle_info(&info, &tag, id(), "NTFS", NodeKind::Other)
+                    .unwrap_err()
+                    .contains("ハードリンク")
+            );
+
+            let info = link_info(id(), false, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, false);
+            assert!(
+                validate_link_handle_info(&info, &tag, id(), "FAT32", NodeKind::Other)
+                    .unwrap_err()
+                    .contains("NTFS")
+            );
+        }
+
+        #[test]
+        fn link_validation_rejects_id_mismatch_and_unknown() {
+            let info = link_info(id(), false, false, 1);
+            let tag = link_tag(IO_REPARSE_TAG_SYMLINK, false, false);
+            let other = FileId {
+                volume: id().volume,
+                index: id().index + 1,
+            };
+            assert!(
+                validate_link_handle_info(&info, &tag, other, "NTFS", NodeKind::Other).is_err()
+            );
+            assert!(validate_link_handle_info(
+                &info,
+                &tag,
+                FileId::UNKNOWN,
+                "NTFS",
+                NodeKind::Other
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn removes_file_symlink_by_handle_keeping_target() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+
+            remove_target(&link, NodeKind::Other, id, link_like).unwrap();
+
+            assert!(fs::symlink_metadata(&link).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+        }
+
+        #[test]
+        fn removes_followed_file_symlink_recorded_as_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+
+            remove_target(&link, NodeKind::File, id, link_like).unwrap();
+
+            assert!(fs::symlink_metadata(&link).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+        }
+
+        #[test]
+        fn removes_directory_symlink_recorded_as_dir_keeping_target() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep.txt"), b"keep").unwrap();
+            let link = dir.path().join("link");
+            create_dir_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+
+            remove_target(&link, NodeKind::Dir, id, link_like).unwrap();
+
+            assert!(fs::symlink_metadata(&link).is_err());
+            assert!(target.is_dir());
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
+        }
+
+        #[test]
+        fn removes_junction_recorded_as_dir_keeping_target() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep.txt"), b"keep").unwrap();
+            let link = dir.path().join("link");
+            create_junction(&target, &link);
+            let (id, link_like) = id_of(&link);
+
+            remove_target(&link, NodeKind::Dir, id, link_like).unwrap();
+
+            assert!(fs::symlink_metadata(&link).is_err());
+            assert!(target.is_dir());
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
+        }
+
+        #[test]
+        fn rejects_readonly_symlink_without_changing_attribute() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            set_link_readonly(&link, true).unwrap();
+            let (id, link_like) = id_of(&link);
+
+            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            assert!(err.contains("読み取り専用"), "{err}");
+            assert!(fs::symlink_metadata(&link).is_ok());
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+
+            set_link_readonly(&link, false).unwrap();
+        }
+
+        #[test]
+        fn rejects_hardlinked_symlink() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            let hard = dir.path().join("hard.txt");
+            let ok = unsafe {
+                CreateHardLinkW(
+                    to_wide(&hard).as_ptr(),
+                    to_wide(&link).as_ptr(),
+                    std::ptr::null(),
+                )
+            };
+            assert!(
+                ok != 0,
+                "リンクへのハードリンクを作成できません: {}",
+                windows_error(last_error())
+            );
+            let (id, link_like) = id_of(&link);
+
+            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            assert!(err.contains("ハードリンク"), "{err}");
+            assert!(fs::symlink_metadata(&link).is_ok());
+            assert!(fs::symlink_metadata(&hard).is_ok());
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+
+            let _ = fs::remove_file(&hard);
+        }
+
+        #[test]
+        fn rejects_link_sharing_conflict_without_path_fallback() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+
+            let lock = unsafe {
+                CreateFileW(
+                    to_wide(&link).as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(lock != INVALID_HANDLE_VALUE && !lock.is_null());
+
+            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            assert!(
+                err.contains("ハンドル") || err.contains("共有") || err.contains("sharing"),
+                "{err}"
+            );
+            assert!(fs::symlink_metadata(&link).is_ok());
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+
+            unsafe {
+                let _ = CloseHandle(lock);
+            }
+        }
+
+        #[test]
+        fn rejects_link_replacement_by_file_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+
+            fs::remove_file(&link).unwrap();
+            create_file_symlink(&target, &link);
+
+            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            assert!(err.contains("置き換わっています"), "{err}");
+            assert!(fs::symlink_metadata(&link).is_ok());
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
         }
     }
 }
