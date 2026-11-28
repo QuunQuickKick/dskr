@@ -469,6 +469,45 @@ fn set_delete_disposition(handle: HANDLE) -> Result<(), u32> {
     }
 }
 
+/// `CloseHandle` 後の最終状態を best-effort で確認する。
+///
+/// `NotFound` だけを削除完了とし、パスが残っている場合や状態を取得できない
+/// 場合は `Unknown` にする。削除指示後の別ハンドル待ち (pending delete) を
+/// 成功として扱わないための確認であり、TOCTOU を完全には排除しない。
+#[cfg(windows)]
+fn verify_deleted_status(
+    fs_path: &Path,
+    expected: FileId,
+    expected_link_like: bool,
+) -> Result<(), DeleteError> {
+    let md = match fs::symlink_metadata(fs_path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(DeleteError::unknown(format!(
+                "削除指示は成功しましたが、対象パスの状態を確認できません: {e}"
+            )));
+        }
+    };
+
+    let current_link_like = md.file_type().is_symlink() || platform::is_reparse_point(&md);
+    let detail = if current_link_like != expected_link_like {
+        "対象の種類が変わっています".to_string()
+    } else {
+        match platform::file_id(&md, fs_path, current_link_like) {
+            Some(id) if id == expected => {
+                "同じ FileId が残っています (他のハンドルが開いている可能性があります)".to_string()
+            }
+            Some(_) => "別の FileId に置き換わっています".to_string(),
+            None => "FileId を取得できません".to_string(),
+        }
+    };
+
+    Err(DeleteError::unknown(format!(
+        "削除指示は成功しましたが、最終状態を確認できません: {detail}"
+    )))
+}
+
 /// Windows ローカル NTFS の通常ファイルを、同一ハンドルで検証して削除する。
 ///
 /// `CreateFileW` 失敗時も、検証失敗時も、path-based 削除へはフォールバックしない。
@@ -524,7 +563,7 @@ fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), DeleteErro
     }
 
     match handle.close() {
-        Ok(()) => Ok(()),
+        Ok(()) => verify_deleted_status(&fs_path, expected, false),
         Err(code) => Err(DeleteError::unknown(format!(
             "削除指示は成功しましたが、ハンドルの解放に失敗しました。ファイルの状態を確認できません: {}",
             windows_error(code)
@@ -709,7 +748,7 @@ fn remove_link_by_handle(
     }
 
     match handle.close() {
-        Ok(()) => Ok(()),
+        Ok(()) => verify_deleted_status(&fs_path, expected, true),
         Err(code) => Err(DeleteError::unknown(format!(
             "リンクの削除指示は成功しましたが、ハンドルの解放に失敗しました。リンクの状態を確認できません: {}",
             windows_error(code)
@@ -1156,7 +1195,7 @@ mod tests {
         use windows_sys::Win32::Foundation::GENERIC_READ;
         use windows_sys::Win32::Storage::FileSystem::{
             CreateHardLinkW, FileBasicInfo, FILE_ATTRIBUTE_ARCHIVE, FILE_BASIC_INFO,
-            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_WRITE_ATTRIBUTES,
         };
 
         fn create_file_symlink(target: &Path, link: &Path) {
@@ -1177,6 +1216,37 @@ mod tests {
                 .status()
                 .expect("mklink /J を起動できる");
             assert!(status.success(), "ジャンクションを作成できません");
+        }
+
+        /// pending delete を作るため、DELETE 共有を許可する別ハンドルを開く。
+        fn open_share_delete_handle(path: &Path) -> HANDLE {
+            let raw = unsafe {
+                CreateFileW(
+                    to_wide(path).as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(
+                raw != INVALID_HANDLE_VALUE && !raw.is_null(),
+                "共有ハンドルを取得できません: {}",
+                windows_error(last_error())
+            );
+            raw
+        }
+
+        fn wait_until_gone(path: &Path) {
+            for _ in 0..100 {
+                if fs::symlink_metadata(path).is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("削除が完了しません: {}", path.display());
         }
 
         fn link_info(
@@ -1757,6 +1827,78 @@ mod tests {
             assert!(err.contains("置き換わっています"), "{err}");
             assert!(fs::symlink_metadata(&link).is_ok());
             assert_eq!(fs::read(&target).unwrap(), b"keep");
+        }
+
+        #[test]
+        fn pending_delete_file_is_unknown() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("pending.txt");
+            fs::write(&file, b"x").unwrap();
+            let (id, link_like) = id_of(&file);
+            let raw = open_share_delete_handle(&file);
+
+            let err = remove_target(&file, NodeKind::File, id, link_like, false).unwrap_err();
+            assert!(matches!(err, DeleteError::Unknown(_)), "{err:?}");
+            assert!(file.exists(), "pending delete のファイルが消えています");
+
+            unsafe {
+                let _ = CloseHandle(raw);
+            }
+            wait_until_gone(&file);
+        }
+
+        #[test]
+        fn pending_delete_file_symlink_is_unknown() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("link.txt");
+            create_file_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+            assert!(link_like);
+            let raw = open_share_delete_handle(&link);
+
+            let err = remove_target(&link, NodeKind::Other, id, link_like, false).unwrap_err();
+            assert!(matches!(err, DeleteError::Unknown(_)), "{err:?}");
+            assert!(
+                fs::symlink_metadata(&link).is_ok(),
+                "pending delete のリンクが消えています"
+            );
+            assert!(target.exists());
+
+            unsafe {
+                let _ = CloseHandle(raw);
+            }
+            wait_until_gone(&link);
+            assert!(target.exists(), "リンク先の実ファイルが削除されました");
+        }
+
+        #[test]
+        fn pending_delete_dir_symlink_is_unknown() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            let keep = target.join("keep.txt");
+            fs::write(&keep, b"keep").unwrap();
+            let link = dir.path().join("link");
+            create_dir_symlink(&target, &link);
+            let (id, link_like) = id_of(&link);
+            assert!(link_like);
+            let raw = open_share_delete_handle(&link);
+
+            let err = remove_target(&link, NodeKind::Dir, id, link_like, false).unwrap_err();
+            assert!(matches!(err, DeleteError::Unknown(_)), "{err:?}");
+            assert!(
+                fs::symlink_metadata(&link).is_ok(),
+                "pending delete のリンクが消えています"
+            );
+            assert!(keep.exists());
+
+            unsafe {
+                let _ = CloseHandle(raw);
+            }
+            wait_until_gone(&link);
+            assert!(keep.exists(), "リンク先の内容が削除されました");
         }
     }
 }
