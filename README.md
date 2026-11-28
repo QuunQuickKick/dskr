@@ -162,8 +162,8 @@ dskr-<version>-linux-x86_64/
 `/usr/share/doc/dskr/`、`/usr/share/licenses/dskr/` に配置します。
 
 ```sh
-sudo apt install ./dskr_0.5.1-1_amd64.deb
-sudo dnf install ./dskr-0.5.1-1.x86_64.rpm
+sudo apt install ./dskr_0.5.2-1_amd64.deb
+sudo dnf install ./dskr-0.5.2-1.x86_64.rpm
 ```
 
 静的 musl のため glibc のバージョンに依存しません。musl libc と Rust 標準
@@ -526,7 +526,7 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 ```json
 {
   "schema_version": 1,
-  "dskr_version": "0.5.1",
+  "dskr_version": "0.5.2",
   "generated_at": "2026-11-25T00:30:04.357Z",
   "root": "\\\\fileserver\\share",
   "root_kind": "unc",

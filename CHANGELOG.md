@@ -6,7 +6,7 @@
 > v0.5.0 以前の GitHub Release 本文は Full Changelog のみだったため、
 > タグ間のコミットと当時の README / USAGE / ACCURACY を根拠にまとめた。
 
-## 未リリース
+## [v0.5.2](https://github.com/QuunQuickKick/dskr/releases/tag/v0.5.2) (2026-11-28)
 
 ### 改善
 
@@ -16,9 +16,16 @@
   削除対象から除外しました。
 - 削除結果を「拒否」「失敗」「一部削除」「状態不明」に区別して表示するように
   しました。
-- Windows のハンドルベース削除で、`CloseHandle` 後の pending delete を
-  best-effort で検出し、削除完了を確認できない場合は `Unknown` として扱う
-  ようにしました。`Unknown` ではツリーを detach せず、自動再試行しません。
+
+### 修正
+
+- Windows でファイルやリンクの削除が pending delete 状態になった場合に、
+  削除完了と誤認しないようにしました。
+- 削除用ハンドルのクローズ後に対象パスの最終状態を確認し、削除完了を確認
+  できない場合は `Unknown` として扱います。
+- `Unknown` の場合はツリーから対象を取り除かず、自動再試行しません。
+- 通常ファイル、ファイルシンボリックリンク、ディレクトリシンボリックリンクの
+  pending delete 回帰テストを追加しました。
 
 ### 安全性・対応範囲
 
@@ -31,7 +38,8 @@
 - UNC / ネットワーク / Unknown の削除拒否を維持します。
 - 走査ルートがシンボリックリンク / ジャンクションの場合は `--allow-delete` を
   無効化します。
-- バージョン番号は変更していません。
+- pending delete の検出は `CloseHandle` 後の事後確認による best-effort であり、
+  TOCTOU を完全には排除しません。
 
 ### 検証
 

@@ -2,7 +2,7 @@
 
 `dskr` は、指定したディレクトリ配下のディスク使用量を高速に調べるツールです。この文書は利用者向けの詳細ガイドです。概要やビルド方法は [README.md](README.md)、サイズの数え方や `du` との違いは [ACCURACY.md](ACCURACY.md) を参照してください。
 
-- 対象バージョン: 0.5.1
+- 対象バージョン: 0.5.2
 - 対象 OS: Windows / macOS / Linux
 - `dskr --help` は、実行する OS に合わせた説明と例を表示します
 
@@ -498,17 +498,17 @@ dskr /data --allow-delete
 
 ```sh
 # Debian / Ubuntu
-sudo apt install ./dskr_0.5.1-1_amd64.deb
+sudo apt install ./dskr_0.5.2-1_amd64.deb
 
 # RHEL / Fedora / openSUSE
-sudo dnf install ./dskr-0.5.1-1.x86_64.rpm
+sudo dnf install ./dskr-0.5.2-1.x86_64.rpm
 ```
 
 tar.gz を使う場合:
 
 ```sh
-tar -xzf dskr-0.5.1-linux-x86_64.tar.gz
-cd dskr-0.5.1-linux-x86_64
+tar -xzf dskr-0.5.2-linux-x86_64.tar.gz
+cd dskr-0.5.2-linux-x86_64
 ./dskr --version
 ```
 
@@ -522,8 +522,8 @@ cd dskr-0.5.1-linux-x86_64
 macOS は Apple Silicon と Intel の両方を含む universal2 の tar.gz です。
 
 ```sh
-tar -xzf dskr-0.5.1-macos-universal2.tar.gz
-cd dskr-0.5.1-macos-universal2
+tar -xzf dskr-0.5.2-macos-universal2.tar.gz
+cd dskr-0.5.2-macos-universal2
 xattr -d com.apple.quarantine ./dskr   # ブラウザで取得した場合
 ./dskr --version
 ```
