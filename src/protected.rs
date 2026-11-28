@@ -235,14 +235,21 @@ fn add_rule(rules: &mut Vec<ProtectedPath>, path: &Path, mode: ProtectMode) {
     let Ok(abs) = absolute_lexical(path) else {
         return;
     };
-    // シンボリックリンクの保護パスは、リンク自身の位置 (字句パス) と
-    // リンク先 (canonical) の両方を保護する。片方だけだと、リンク自身の
-    // 削除やリンク先の削除を取りこぼす。
+    // シンボリックリンクの保護パスは、リンク自身の位置 (字句パス)、
+    // リンク先 (canonical)、canonical 親 + 末端名の 3 通りを保護する。
+    // 親がリンクの場合、リンク自身の削除は「canonical 親 + 名前」でしか
+    // 一致しないため、この形も必要になる。
     let lexical = strip_verbatim(&abs);
     let canonical = std::fs::canonicalize(&abs)
         .map(|p| strip_verbatim(&p))
         .unwrap_or_else(|_| lexical.clone());
-    for normalized in [lexical, canonical] {
+    let link_entry = match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| strip_verbatim(&p).join(name))
+            .unwrap_or_else(|_| lexical.clone()),
+        _ => lexical.clone(),
+    };
+    for normalized in [lexical, canonical, link_entry] {
         if rules
             .iter()
             .any(|r| r.mode == mode && paths_equal(&r.path, &normalized))
@@ -286,10 +293,15 @@ mod tests {
     use std::fs;
 
     fn rules_for(path: &Path, mode: ProtectMode) -> Vec<ProtectedPath> {
-        vec![ProtectedPath {
-            path: path.to_path_buf(),
-            mode,
-        }]
+        let mut rules = Vec::new();
+        add_rule(&mut rules, path, mode);
+        rules
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path)
+            .map(|p| strip_verbatim(&p))
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 
     #[test]
@@ -335,6 +347,7 @@ mod tests {
         let user = homes.join("alice");
         fs::create_dir_all(user.join("project")).unwrap();
         let rules = Vec::new();
+        let homes = canonical(&homes);
 
         let err =
             check_protected_with(&user, false, &rules, std::slice::from_ref(&homes)).unwrap_err();
@@ -361,11 +374,50 @@ mod tests {
         let link = homes.join("bob");
         symlink(&outside, &link).unwrap();
         let rules = Vec::new();
+        let homes = canonical(&homes);
 
         let err =
             check_protected_with(&link, true, &rules, std::slice::from_ref(&homes)).unwrap_err();
         assert!(err.contains("ホーム"), "{err}");
         assert!(outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rule_under_symlinked_parent_is_canonicalized() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(real.join("protected")).unwrap();
+        let link_parent = dir.path().join("link_parent");
+        symlink(&real, &link_parent).unwrap();
+
+        let rules = rules_for(&link_parent.join("protected"), ProtectMode::Exact);
+        assert!(check_protected_with(&link_parent.join("protected"), false, &rules, &[]).is_err());
+        assert!(check_protected_with(&real.join("protected"), false, &rules, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rule_link_entry_under_symlinked_parent_is_protected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link_parent = dir.path().join("link_parent");
+        symlink(&real, &link_parent).unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let entry = link_parent.join("entry");
+        symlink(&target, &entry).unwrap();
+
+        let mut rules = Vec::new();
+        add_rule(&mut rules, &entry, ProtectMode::Exact);
+        // リンク自身の削除は canonical 親 + 名前で判定される。
+        assert!(check_protected_with(&entry, true, &rules, &[]).is_err());
+        assert!(check_protected_with(&target, false, &rules, &[]).is_err());
     }
 
     #[cfg(unix)]
@@ -405,16 +457,9 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         let file = tmp.join("keep.txt");
         fs::write(&file, b"x").unwrap();
-        let rules = vec![
-            ProtectedPath {
-                path: private.clone(),
-                mode: ProtectMode::Exact,
-            },
-            ProtectedPath {
-                path: tmp.clone(),
-                mode: ProtectMode::Exact,
-            },
-        ];
+        let mut rules = Vec::new();
+        add_rule(&mut rules, &private, ProtectMode::Exact);
+        add_rule(&mut rules, &tmp, ProtectMode::Exact);
 
         assert!(check_protected_with(&private, false, &rules, &[]).is_err());
         assert!(check_protected_with(&tmp, false, &rules, &[]).is_err());
