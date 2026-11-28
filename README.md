@@ -265,6 +265,24 @@ dskr-<version>-windows-x86_64.zip.sha256
 タグ名と `Cargo.toml` の `version` が一致しない場合は失敗します。
 再実行時は既存 Release に成果物を追加し直します。
 
+#### リリースノート
+
+`.github/RELEASE_NOTES_TEMPLATE.md` の構成に従います。見出しは
+「対象環境 → 改善 → 安全性・対応範囲 → 検証」の順とし、先頭の「対象環境」は
+省略しません。
+
+- `CHANGELOG.md` とコミット履歴から内容を作る
+- Windows のハンドルベース削除に触れる場合は、Windows 11 / ローカル NTFS 限定で
+  あること、Windows 全般ではないこと、対象外の環境を明記する
+- 未検証事項は「未検証」と書き、PASS 扱いにしない
+- タグ push 後に Release ワークフローが作成したリリースへ反映する
+
+```sh
+gh release edit vX.Y.Z \
+  --title "dskr vX.Y.Z" \
+  --notes-file release-notes.md
+```
+
 Linux のビルドスクリプトはビルド後に `dskr --version` と
 `dskr . --no-tui --max-depth 1 --top 5` で起動確認を行います。
 macOS のビルドスクリプトは universal2 の `lipo -archs` と起動確認を行います。

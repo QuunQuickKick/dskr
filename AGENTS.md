@@ -50,9 +50,12 @@ aarch64 + x86_64 の universal2 tar.gz を作る。Xcode Command Line Tools と
   更新する。
 - **利用者向け文字列・エラー・コメント・文書は日本語。** この方針を維持し、
   英語に翻訳しない。
-- **リリースノートの対象環境:** Windows のハンドルベース削除は
-  Windows 11 / ローカル NTFS に限定される。Windows 全般で安全に削除できると
-  誤解されないよう、リリースノートに対象環境と対象外を明記する。
+- **リリースノート:** `.github/RELEASE_NOTES_TEMPLATE.md` の構成に従う。
+  先頭に「対象環境」を置き、Windows のハンドルベース削除は
+  Windows 11 / ローカル NTFS に限定されることを明記する。Windows 全般で
+  安全に削除できると誤解されないよう、対象外の環境・操作も書く。
+  `CHANGELOG.md` とコミット履歴から作成し、タグ push 後に Release ワークフローが
+  作成したリリースへ `gh release edit --notes-file` で反映する。
 - **既定値はテスト済みの仕様:** 隠し項目は `--hidden` 指定時のみ表示。
   ヘッドレスの既定形式は `report`。`--json` 単独でもヘッドレスになりファイル
   だけを書き出す。`--format json` と `--json` は併用不可。`--allow-delete` は
