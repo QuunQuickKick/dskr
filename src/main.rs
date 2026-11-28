@@ -193,7 +193,9 @@ fn try_main(cli: Cli) -> Result<u32, String> {
     }
 
     let delete_blocked_reason = if cli.allow_delete {
-        cfg.identity_blocked_reason().map(str::to_string)
+        cfg.identity_blocked_reason()
+            .map(str::to_string)
+            .or_else(|| root_link_delete_reason(&root))
     } else {
         None
     };
@@ -240,6 +242,34 @@ fn headless_requested(cli: &Cli) -> bool {
         || cli.output.is_some()
         || cli.json.is_some()
         || cli.csv.is_some()
+}
+
+/// 走査ルート自体がリンクの場合、リンク経由の削除を避けるため削除を拒否する。
+fn root_link_delete_reason(root: &Path) -> Option<String> {
+    // `..` はリンクを辿った後に親へ移動するため、リンク判定を単純化できない。
+    if root
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Some(
+            "走査ルートに `..` を含むため削除できません。正規化したパスを指定してください".into(),
+        );
+    }
+    // 末尾の区切りや `./` は symlink_metadata がリンクを辿る原因になるため、
+    // 字句的に落としてから最終要素を判定する。
+    let normalized: PathBuf = root
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    let md = fs::symlink_metadata(&normalized).ok()?;
+    if md.file_type().is_symlink() || dskr::scan::platform::is_reparse_point(&md) {
+        Some(
+            "走査ルートがシンボリックリンク / ジャンクションのため削除できません。実体のパスを指定してください"
+                .into(),
+        )
+    } else {
+        None
+    }
 }
 
 fn to_output_format(arg: OutputFormatArg) -> OutputFormat {
@@ -580,4 +610,33 @@ fn run_tui(p: TuiParams) -> Result<(u32, bool), String> {
 
     let _ = terminal.show_cursor();
     Ok((if app.cancel_requested { 130 } else { 0 }, app.force_quit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_root_does_not_block_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(root_link_delete_reason(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_root_blocks_delete() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        assert!(root_link_delete_reason(&link).is_some());
+        let with_slash = PathBuf::from(format!("{}/", link.display()));
+        assert!(root_link_delete_reason(&with_slash).is_some());
+        assert!(root_link_delete_reason(&target).is_none());
+        assert!(root_link_delete_reason(&target.join("..")).is_some());
+    }
 }

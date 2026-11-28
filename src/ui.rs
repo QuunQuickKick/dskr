@@ -577,8 +577,8 @@ fn help_lines() -> Vec<&'static str> {
         "  ?              このヘルプ",
         "  q              終了",
         "",
-        "  削除は確認ダイアログで確定します (ファイルは y、フォルダは yes 入力)",
-        "  削除は完全削除で、フォルダは中身ごと削除されます",
+        "  削除は確認ダイアログで確定します (ファイルは y、空のフォルダは yes 入力)",
+        "  削除は完全削除で、フォルダは空のときだけ削除されます",
         "  削除できるのは現在のフォルダの子項目だけです (走査中は不可)",
         "  走査中: Space=一時停止/再開, Esc=中止 (途中までの結果を表示), q=中止して終了",
         "  既定の並び順: サイズの大きい順",
@@ -644,10 +644,10 @@ fn draw_confirm_delete(f: &mut Frame, app: &App, area: Rect) {
     let dim = Style::new().fg(Color::DarkGray);
     let value = Style::new().fg(Color::Cyan);
     let kind = match target.kind {
-        NodeKind::Dir => "フォルダ (中身ごと)",
+        NodeKind::Dir => "フォルダ (空のときのみ)",
         NodeKind::File => "ファイル",
         NodeKind::Other => "リンク / 特殊 (中身は削除しません)",
-        NodeKind::Blocked => "走査対象外 (中身は削除しません)",
+        NodeKind::Blocked => "走査対象外 (空のときのみ)",
     };
     let path = target.path.display().to_string();
     let path = short_path_display(
@@ -706,13 +706,16 @@ fn draw_confirm_delete(f: &mut Frame, app: &App, area: Rect) {
         )));
         if target.kind == NodeKind::Dir {
             lines.push(Line::from(Span::styled(
-                fit_width(" フォルダの中身もすべて削除されます。", inner_w),
+                fit_width(
+                    " 空のフォルダのみ削除できます。中身は削除しません。",
+                    inner_w,
+                ),
                 Style::new().fg(Color::Red),
             )));
             if target.truncated {
                 lines.push(Line::from(Span::styled(
                     fit_width(
-                        " 表示・集計されていない項目も含まれる可能性があります。",
+                        " 表示されていない項目がある場合、空でも削除できないことがあります。",
                         inner_w,
                     ),
                     Style::new().fg(Color::Red),
@@ -1022,8 +1025,9 @@ mod tests {
         assert!(compact.contains("削除の確認"), "{text}");
         assert!(compact.contains("victim"), "{text}");
         assert!(compact.contains("取り消せません"), "{text}");
-        assert!(compact.contains("中身もすべて削除"), "{text}");
-        assert!(compact.contains("集計されていない"), "{text}");
+        assert!(compact.contains("空のフォルダのみ削除"), "{text}");
+        assert!(compact.contains("中身は削除しません"), "{text}");
+        assert!(compact.contains("表示されていない項目"), "{text}");
         assert!(compact.contains("yes"), "{text}");
     }
 

@@ -718,7 +718,8 @@ fn network_identity_is_suppressed_for_all_node_kinds() {
 
     // ルート・ディレクトリ・ファイル・リンクのすべてで削除を拒否する。
     let root_kind = dskr::scan::node::NodeKind::Dir;
-    let err = dskr::delete::check_target(dir.path(), root_kind, out.tree.id(0), false).unwrap_err();
+    let err = dskr::delete::check_target(dir.path(), root_kind, out.tree.id(0), false, false)
+        .unwrap_err();
     assert!(err.contains("走査時"), "{err}");
 
     let file_idx = child(&out, "a.txt").unwrap();
@@ -728,6 +729,7 @@ fn network_identity_is_suppressed_for_all_node_kinds() {
         file_node.kind,
         out.tree.id(file_idx),
         out.tree.id_link_like(file_idx),
+        false,
     )
     .unwrap_err();
     assert!(err.contains("走査時"), "{err}");
@@ -740,6 +742,7 @@ fn network_identity_is_suppressed_for_all_node_kinds() {
         sub_node.kind,
         out.tree.id(sub_idx),
         out.tree.id_link_like(sub_idx),
+        false,
     )
     .unwrap_err();
     assert!(err.contains("走査時"), "{err}");
@@ -754,6 +757,7 @@ fn network_identity_is_suppressed_for_all_node_kinds() {
             link_node.kind,
             out.tree.id(link_idx),
             out.tree.id_link_like(link_idx),
+            false,
         )
         .unwrap_err();
         assert!(err.contains("走査時"), "{err}");

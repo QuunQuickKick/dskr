@@ -1666,6 +1666,7 @@ mod tests {
                 out.tree.node(idx).kind,
                 out.tree.id(idx),
                 out.tree.id_link_like(idx),
+                false,
             )
             .unwrap_err();
             assert!(err.contains("走査時"), "{rel}: {err}");
@@ -1678,6 +1679,7 @@ mod tests {
             out.tree.node(local_idx).kind,
             out.tree.id(local_idx),
             out.tree.id_link_like(local_idx),
+            false,
         )
         .unwrap();
         assert!(!root.join("local.txt").exists());

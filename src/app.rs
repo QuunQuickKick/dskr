@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -125,6 +125,70 @@ fn subtree_indices(tree: &Tree, root: u32) -> Vec<u32> {
         stack.extend(tree.node(idx).children.iter().copied());
     }
     out
+}
+
+/// 選択ノードが、走査時にリンクを辿って到達した子孫か。
+fn has_link_ancestor(tree: &Tree, idx: u32) -> bool {
+    let mut cur = idx;
+    loop {
+        let node = tree.node(cur);
+        if node.parent == u32::MAX {
+            break;
+        }
+        let parent = node.parent;
+        if tree.id_link_like(parent) {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// 走査ルートから対象までの途中に、現在リンク / 再解析ポイントがあるか。
+///
+/// 走査時点のリンク祖先は `has_link_ancestor` で判定する。こちらは確認
+/// ダイアログを開いてから削除するまでの置き換えを検出するための検査。
+fn has_current_link_ancestor(root: &Path, path: &Path) -> Result<bool, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "削除対象が走査ルートの外にあります (削除を中止しました)".to_string())?;
+    let components: Vec<_> = relative.components().collect();
+    let mut current = root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        let md = std::fs::symlink_metadata(&current)
+            .map_err(|e| format!("削除対象の祖先を確認できないため、削除を中止しました: {e}"))?;
+        if md.file_type().is_symlink() || crate::scan::platform::is_reparse_point(&md) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn delete_error_message(path: &Path, err: &delete::DeleteError) -> String {
+    match err {
+        delete::DeleteError::Refused(_) => {
+            format!("削除しませんでした: {}: {err}", path.display())
+        }
+        delete::DeleteError::Failed(_) => {
+            format!(
+                "削除に失敗しました (削除されていません): {}: {err}",
+                path.display()
+            )
+        }
+        delete::DeleteError::Partial(_) => {
+            format!(
+                "一部のみ削除されました。再走査してください: {}: {err}",
+                path.display()
+            )
+        }
+        delete::DeleteError::Unknown(_) => {
+            format!(
+                "削除の最終状態を確認できません。再走査してください: {}: {err}",
+                path.display()
+            )
+        }
+    }
 }
 
 impl App {
@@ -364,6 +428,8 @@ impl App {
         let path = self.path_of(idx);
         let expected = t.id(idx);
         let expected_link_like = t.id_link_like(idx);
+        #[cfg(not(windows))]
+        let has_children = !n.children.is_empty();
         if let Some(reason) = self.delete_blocked_reason.clone() {
             // ネットワーク等では走査時に ID を収集していない。削除確認を開いて
             // 理由を示し、確定操作は受け付けない。
@@ -384,10 +450,31 @@ impl App {
             self.mode = Mode::ConfirmDelete;
             return;
         }
-        let kind = match delete::check_target(&path, recorded_kind, expected, expected_link_like) {
+        let through_link = has_link_ancestor(t, idx)
+            || match has_current_link_ancestor(&self.root, &path) {
+                Ok(found) => found,
+                Err(e) => {
+                    self.message = Some(format!("削除しませんでした: {e}"));
+                    return;
+                }
+            };
+        if through_link {
+            self.message = Some(
+                "削除しませんでした: リンク経由で到達した項目は削除できません (リンク先を直接開いてください)"
+                    .into(),
+            );
+            return;
+        }
+        let kind = match delete::check_target(
+            &path,
+            recorded_kind,
+            expected,
+            expected_link_like,
+            through_link,
+        ) {
             Ok(kind) => kind,
             Err(e) => {
-                self.message = Some(e);
+                self.message = Some(format!("削除しませんでした: {e}"));
                 return;
             }
         };
@@ -396,7 +483,7 @@ impl App {
         // 消す。ツリーからはリンクノードだけを外し、子ノードは削除しない。
         // それ以外の環境では、従来どおり集計ずれを避けるため拒否する。
         #[cfg(not(windows))]
-        if kind == NodeKind::Other && !n.children.is_empty() {
+        if kind == NodeKind::Other && has_children {
             self.message = Some(
                 "--follow-links で辿ったリンクは削除できません (リンク先を直接開いてください)"
                     .into(),
@@ -496,11 +583,34 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
+        // 確認ダイアログを開いてから削除するまでの間に、祖先がリンクへ
+        // 置き換わっていないか再確認する。走査時のリンク祖先も拒否する。
+        let tree_through = self
+            .tree()
+            .is_some_and(|tree| has_link_ancestor(tree, target.node));
+        let current_through = match has_current_link_ancestor(&self.root, &target.path) {
+            Ok(found) => found,
+            Err(e) => {
+                self.mode = Mode::Normal;
+                self.message = Some(format!("削除しませんでした: {e}"));
+                return;
+            }
+        };
+        let through_link = tree_through || current_through;
+        if through_link {
+            self.mode = Mode::Normal;
+            self.message = Some(
+                "削除しませんでした: リンク経由で到達した項目は削除できません (リンク先を直接開いてください)"
+                    .into(),
+            );
+            return;
+        }
         match delete::remove_target(
             &target.path,
             target.kind,
             target.expected,
             target.expected_link_like,
+            through_link,
         ) {
             Ok(()) => {
                 if let Some(out) = self.outcome.as_mut() {
@@ -543,10 +653,7 @@ impl App {
             }
             Err(e) => {
                 self.mode = Mode::Normal;
-                self.message = Some(format!(
-                    "削除できませんでした (一部のみ削除された可能性があります): {}: {e}",
-                    target.path.display()
-                ));
+                self.message = Some(delete_error_message(&target.path, &e));
             }
         }
     }
@@ -1335,7 +1442,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn deleting_directory_with_hardlink_owner_moves_allocation_outside() {
+    fn deleting_hardlink_owner_inside_directory_moves_allocation_to_survivor() {
         use std::collections::HashMap;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1389,22 +1496,23 @@ mod tests {
         });
 
         app.delete_target = Some(DeleteTarget {
-            node: sub_idx,
-            path: sub.clone(),
-            kind: NodeKind::Dir,
-            expected: app.tree().unwrap().id(sub_idx),
+            node: inside_idx,
+            path: inside.clone(),
+            kind: NodeKind::File,
+            expected: app.tree().unwrap().id(inside_idx),
             expected_link_like: false,
             bytes: 100,
             files: 1,
             dirs: 0,
             truncated: false,
             blocked_reason: None,
-            input: "yes".into(),
+            input: String::new(),
             error: None,
         });
         app.perform_delete();
 
-        assert!(!sub.exists());
+        assert!(!inside.exists());
+        assert!(sub.exists());
         assert!(outside.exists());
         let tree = app.tree().unwrap();
         assert_eq!(tree.node(outside_idx).own_alloc, 100);
@@ -1504,6 +1612,127 @@ mod tests {
         assert!(dir.path().exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn refuses_delete_through_followed_link_child() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let secret = real.join("secret.txt");
+        std::fs::write(&secret, b"keep").unwrap();
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        let mut tree = Tree::with_root(dir.path().as_os_str().to_owned(), 0);
+        if let Ok(md) = std::fs::symlink_metadata(dir.path()) {
+            if let Some(id) = platform::file_id(&md, dir.path(), false) {
+                tree.set_id(0, id, false);
+            }
+        }
+        let link_idx = tree
+            .push_child_capped(0, Node::other("link".into(), 0, 1, 0, 0, 0), 100)
+            .unwrap();
+        let link_md = std::fs::symlink_metadata(&link).unwrap();
+        tree.set_id(
+            link_idx,
+            platform::file_id(&link_md, &link, true).unwrap(),
+            true,
+        );
+        let secret_idx = tree
+            .push_child_capped(
+                link_idx,
+                Node::file("secret.txt".into(), link_idx, 2, 0, 5, 0),
+                100,
+            )
+            .unwrap();
+        let secret_md = std::fs::symlink_metadata(&secret).unwrap();
+        tree.set_id(
+            secret_idx,
+            platform::file_id(&secret_md, &secret, false).unwrap(),
+            false,
+        );
+        tree.aggregate();
+
+        let mut app = test_app_at(dir.path(), true);
+        app.finish(ScanOutcome {
+            tree,
+            errors: Vec::new(),
+            hardlink_groups: Default::default(),
+            truncated: false,
+            cancelled: false,
+            entries: 2,
+            dirs: 0,
+            error_count: 0,
+            bytes_alloc: 5,
+            bytes_logical: 5,
+            elapsed: Duration::from_millis(1),
+            root: dir.path().to_path_buf(),
+        });
+        app.stack = vec![0, link_idx];
+        app.rebuild();
+        select_name(&mut app, "secret.txt");
+
+        app.begin_delete();
+        assert!(app.delete_target.is_none());
+        assert!(app.message.as_deref().unwrap_or("").contains("リンク経由"));
+        assert!(secret.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_delete_when_ancestor_became_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("a");
+        std::fs::create_dir(&ancestor).unwrap();
+        let file = ancestor.join("b.txt");
+        std::fs::write(&file, b"keep").unwrap();
+
+        let mut app = test_app_at(dir.path(), true);
+        finish_real_scan(&mut app, dir.path());
+        let a_idx = {
+            let tree = app.tree().unwrap();
+            tree.node(tree.root)
+                .children
+                .iter()
+                .copied()
+                .find(|&i| tree.node(i).name.to_string_lossy() == "a")
+                .unwrap()
+        };
+        app.stack.push(a_idx);
+        app.rebuild();
+        select_name(&mut app, "b.txt");
+
+        let moved = dir.path().join("a-real");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        symlink(&moved, &ancestor).unwrap();
+
+        app.begin_delete();
+        assert!(app.delete_target.is_none());
+        assert!(app.message.as_deref().unwrap_or("").contains("リンク経由"));
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn delete_error_message_distinguishes_states() {
+        let path = Path::new("/tmp/victim");
+        let refused = delete::DeleteError::Refused("refused".into());
+        assert!(delete_error_message(path, &refused).contains("削除しませんでした"));
+        let failed = delete::DeleteError::Failed("failed".into());
+        assert!(delete_error_message(path, &failed).contains("削除されていません"));
+        let partial = delete::DeleteError::Partial("partial".into());
+        let message = delete_error_message(path, &partial);
+        assert!(message.contains("一部のみ"));
+        assert!(message.contains("再走査"));
+        let unknown = delete::DeleteError::Unknown("unknown".into());
+        let message = delete_error_message(path, &unknown);
+        assert!(message.contains("最終状態"));
+        assert!(message.contains("再走査"));
+    }
+
     #[test]
     fn delete_failure_keeps_tree_and_reports_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1524,7 +1753,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap_or("")
-            .contains("削除できませんでした"));
+            .contains("削除しませんでした"));
         assert_eq!(
             app.tree()
                 .unwrap()
@@ -1594,33 +1823,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn partial_delete_failure_keeps_tree() {
-        use std::os::unix::fs::PermissionsExt;
-
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
+    fn non_empty_directory_delete_keeps_tree() {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
-        let locked = victim.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        std::fs::write(locked.join("keep"), b"x").unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        let child = victim.join("keep");
+        std::fs::write(&child, b"x").unwrap();
         let mut app = test_app_at(dir.path(), true);
         finish_real_scan(&mut app, dir.path());
         select_name(&mut app, "victim");
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
         app.begin_delete();
         app.delete_target.as_mut().unwrap().input = "yes".into();
         app.perform_delete();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(victim.exists());
+        assert!(child.exists());
         assert!(app
             .message
             .as_deref()
             .unwrap_or("")
-            .contains("削除できませんでした"));
+            .contains("削除しませんでした"));
         assert!(app
             .tree()
             .unwrap()
@@ -1713,8 +1936,7 @@ mod tests {
     fn delete_directory_requires_yes_input() {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
-        std::fs::create_dir_all(victim.join("nested")).unwrap();
-        std::fs::write(victim.join("nested").join("a.bin"), b"x").unwrap();
+        std::fs::create_dir(&victim).unwrap();
         let mut app = test_app_at(dir.path(), true);
         finish_real_scan(&mut app, dir.path());
         select_name(&mut app, "victim");

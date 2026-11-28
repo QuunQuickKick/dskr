@@ -4,6 +4,7 @@ pub mod delete;
 pub mod format;
 pub mod output;
 pub mod path;
+mod protected;
 pub mod report;
 pub mod scan;
 pub mod sort;

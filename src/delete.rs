@@ -1,9 +1,11 @@
 //! TUI からの削除処理。シンボリックリンク / ジャンクションはリンク先を
 //! 辿らず、リンク自体だけを削除する。
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::protected;
 use crate::scan::node::{FileId, NodeKind};
 use crate::scan::platform;
 
@@ -29,6 +31,64 @@ const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 #[cfg(windows)]
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
+/// Windows の `RemoveDirectoryW` が非空ディレクトリで返すエラー。
+#[cfg(windows)]
+const ERROR_DIR_NOT_EMPTY: i32 = 145;
+/// Windows の使用中 / マウントポイント関連のエラー。
+#[cfg(windows)]
+const ERROR_BUSY: i32 = 170;
+
+/// 削除処理の結果。安全性条件を満たさない場合と、実行して失敗した場合、
+/// 最終状態を確定できない場合を区別する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteError {
+    /// 安全性条件を満たさず、削除処理を実行していない。
+    Refused(String),
+    /// 削除処理を実行したが、失敗を確認できた。
+    Failed(String),
+    /// 複数対象のうち一部だけ削除された。0.5.x では発生しない。
+    Partial(String),
+    /// 削除指示後の状態を確定できない。
+    Unknown(String),
+}
+
+impl DeleteError {
+    pub fn message(&self) -> &str {
+        match self {
+            DeleteError::Refused(message)
+            | DeleteError::Failed(message)
+            | DeleteError::Partial(message)
+            | DeleteError::Unknown(message) => message,
+        }
+    }
+
+    /// メッセージに指定した文字列が含まれるか。テストと表示用。
+    pub fn contains(&self, needle: &str) -> bool {
+        self.message().contains(needle)
+    }
+
+    fn refused(message: impl Into<String>) -> Self {
+        DeleteError::Refused(message.into())
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        DeleteError::Failed(message.into())
+    }
+
+    #[allow(dead_code)]
+    fn unknown(message: impl Into<String>) -> Self {
+        DeleteError::Unknown(message.into())
+    }
+}
+
+impl fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for DeleteError {}
+
 /// Windows の長いパスでも削除できるように変換する。
 fn deletable_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -50,7 +110,13 @@ pub fn check_target(
     kind: NodeKind,
     expected: FileId,
     expected_link_like: bool,
-) -> Result<NodeKind, String> {
+    through_link: bool,
+) -> Result<NodeKind, DeleteError> {
+    if through_link {
+        return Err(DeleteError::refused(
+            "リンク経由で到達した項目は削除できません (リンク先を直接開いてください)",
+        ));
+    }
     verify_target(path, kind, expected, expected_link_like).map(|(kind, _)| kind)
 }
 
@@ -63,38 +129,44 @@ fn verify_target(
     kind: NodeKind,
     expected: FileId,
     expected_link_like: bool,
-) -> Result<(NodeKind, fs::Metadata), String> {
+) -> Result<(NodeKind, fs::Metadata), DeleteError> {
     let fs_path = deletable_path(path);
     let md = fs::symlink_metadata(&fs_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            format!("対象が存在しません: {}", path.display())
+            DeleteError::refused(format!("対象が存在しません: {}", path.display()))
         } else {
-            format!("対象を確認できません: {e}")
+            DeleteError::refused(format!("対象を確認できません: {e}"))
         }
     })?;
     let ft = md.file_type();
     let link_like = ft.is_symlink() || platform::is_reparse_point(&md);
 
     if !expected.is_known() {
-        return Err(
-            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
-                .into(),
-        );
+        return Err(DeleteError::refused(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました",
+        ));
     }
     let Some(current) = platform::file_id(&md, &fs_path, link_like) else {
-        return Err("削除対象のファイル識別情報を取得できないため、削除を中止しました".into());
+        return Err(DeleteError::refused(
+            "削除対象のファイル識別情報を取得できないため、削除を中止しました",
+        ));
     };
     if current != expected {
-        return Err("走査時から対象が置き換わっています (削除を中止しました)".into());
+        return Err(DeleteError::refused(
+            "走査時から対象が置き換わっています (削除を中止しました)",
+        ));
     }
     if link_like != expected_link_like {
-        return Err(if link_like {
+        return Err(DeleteError::refused(if link_like {
             "対象がリンクに変わっています (削除を中止しました)"
         } else {
             "対象がリンクではなくなっています (削除を中止しました)"
-        }
-        .into());
+        }));
     }
+
+    // ネットワーク / Unknown は上の ID 検査で拒否済み。ここではローカルと
+    // 確認できた対象だけを canonicalize し、保護パスを判定する。
+    protected::check_protected_path(path, link_like).map_err(DeleteError::Refused)?;
 
     // リンク・ジャンクションは、記録上の種別にかかわらずリンク自身だけを消す。
     // 走査後に通常ファイルからリンクへ変わった場合は、上の ID 照合で拒否される。
@@ -104,19 +176,21 @@ fn verify_target(
         match kind {
             NodeKind::Dir => {
                 if !ft.is_dir() {
-                    return Err("対象がフォルダではなくなっています".into());
+                    return Err(DeleteError::refused("対象がフォルダではなくなっています"));
                 }
                 NodeKind::Dir
             }
             NodeKind::File => {
                 if ft.is_dir() {
-                    return Err("対象がフォルダに変わっています (削除を中止しました)".into());
+                    return Err(DeleteError::refused(
+                        "対象がフォルダに変わっています (削除を中止しました)",
+                    ));
                 }
                 NodeKind::File
             }
             NodeKind::Blocked => {
                 if !ft.is_dir() {
-                    return Err("対象がフォルダではなくなっています".into());
+                    return Err(DeleteError::refused("対象がフォルダではなくなっています"));
                 }
                 NodeKind::Blocked
             }
@@ -125,7 +199,9 @@ fn verify_target(
                 // ディレクトリは、リンク追従の重複として Other になった実体を
                 // 空のときだけ削除できる既存動作を維持する。
                 if ft.is_file() {
-                    return Err("対象の種類が変わっています (削除を中止しました)".into());
+                    return Err(DeleteError::refused(
+                        "対象の種類が変わっています (削除を中止しました)",
+                    ));
                 }
                 NodeKind::Other
             }
@@ -138,20 +214,25 @@ fn verify_target(
 ///
 /// - Windows の通常ファイル: 同一ハンドルで検証して disposition を設定
 /// - ファイル (Windows 以外): ファイルを削除
-/// - フォルダ: 中身ごと削除
+/// - フォルダ: 空のときだけ削除する (再帰削除はしない)
 /// - リンク / ジャンクション / 特殊ファイル: リンク先を辿らず実体だけ削除
 ///
 /// 走査後に種類やファイル ID が変わっていた場合は、意図しない削除を避けるため
-/// エラーにする。ディレクトリは自身の ID だけを検証し、中身は削除実行時点の
-/// 状態を削除する。
+/// エラーにする。`remove_dir_all` は使わない。
 pub fn remove_target(
     path: &Path,
     kind: NodeKind,
     expected: FileId,
     expected_link_like: bool,
-) -> Result<(), String> {
+    through_link: bool,
+) -> Result<(), DeleteError> {
     #[cfg(windows)]
     let recorded_kind = kind;
+    if through_link {
+        return Err(DeleteError::refused(
+            "リンク経由で到達した項目は削除できません (リンク先を直接開いてください)",
+        ));
+    }
     let (kind, md) = verify_target(path, kind, expected, expected_link_like)?;
 
     // Phase 2-C: Windows のリンク / ジャンクションは、リンク自身の
@@ -168,11 +249,69 @@ pub fn remove_target(
         return remove_file_by_handle(path, expected);
     }
 
+    // 再解析ポイントが通常のディレクトリ経路に流れ込んだ場合は削除しない。
+    if platform::is_reparse_point(&md) {
+        return Err(DeleteError::refused(
+            "リンク / 再解析ポイントは通常のフォルダ削除では削除できません",
+        ));
+    }
+
     let fs_path = deletable_path(path);
     match kind {
-        NodeKind::Dir => fs::remove_dir_all(&fs_path).map_err(|e| format!("削除に失敗: {e}")),
-        NodeKind::File => fs::remove_file(&fs_path).map_err(|e| format!("削除に失敗: {e}")),
+        NodeKind::Dir => remove_empty_dir(&fs_path),
+        NodeKind::File => fs::remove_file(&fs_path).map_err(map_remove_file_error),
         NodeKind::Other | NodeKind::Blocked => remove_link_or_leaf(&fs_path, &md),
+    }
+}
+
+/// 空のディレクトリだけを削除する。
+///
+/// `remove_dir` は非再帰なので、非空ディレクトリ、マウントポイント、
+/// マウント境界を含むディレクトリは OS が拒否する。これにより、
+/// スキャン時に見えていないマウントや隠しファイルへ削除範囲が広がらない。
+fn remove_empty_dir(path: &Path) -> Result<(), DeleteError> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if is_dir_not_empty(&e) => Err(DeleteError::refused(
+            "フォルダが空ではないため削除しませんでした (表示されていない項目を含む可能性があります)",
+        )),
+        Err(e) if is_mount_busy(&e) => Err(DeleteError::refused(
+            "マウントポイントまたは使用中のため削除しませんでした",
+        )),
+        Err(e) => Err(map_remove_file_error(e)),
+    }
+}
+
+fn map_remove_file_error(e: std::io::Error) -> DeleteError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        DeleteError::failed(format!(
+            "対象は既に存在しません。他のプロセスが削除した可能性があります: {e}"
+        ))
+    } else {
+        DeleteError::failed(format!("削除に失敗: {e}"))
+    }
+}
+
+fn is_dir_not_empty(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+        return true;
+    }
+    match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(code) => code == libc::ENOTEMPTY || code == libc::EEXIST,
+        #[cfg(windows)]
+        Some(code) => code == ERROR_DIR_NOT_EMPTY,
+        _ => false,
+    }
+}
+
+fn is_mount_busy(e: &std::io::Error) -> bool {
+    match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(code) => code == libc::EBUSY,
+        #[cfg(windows)]
+        Some(code) => code == ERROR_BUSY,
+        _ => false,
     }
 }
 
@@ -334,12 +473,11 @@ fn set_delete_disposition(handle: HANDLE) -> Result<(), u32> {
 ///
 /// `CreateFileW` 失敗時も、検証失敗時も、path-based 削除へはフォールバックしない。
 #[cfg(windows)]
-fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), String> {
+fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), DeleteError> {
     if !expected.is_known() {
-        return Err(
-            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
-                .into(),
-        );
+        return Err(DeleteError::refused(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました",
+        ));
     }
 
     let fs_path = deletable_path(path);
@@ -356,22 +494,22 @@ fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), String> {
         )
     };
     if raw == INVALID_HANDLE_VALUE || raw.is_null() {
-        return Err(format!(
+        return Err(DeleteError::refused(format!(
             "削除用ハンドルを取得できないため、削除を中止しました: {}",
             windows_error(last_error())
-        ));
+        )));
     }
     let mut handle = DeleteHandle::new(raw);
 
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.raw(), &mut info) } == 0 {
-        return Err(format!(
+        return Err(DeleteError::refused(format!(
             "削除対象のファイル情報を取得できないため、削除を中止しました: {}",
             windows_error(last_error())
-        ));
+        )));
     }
-    let fs_name = volume_fs_name(handle.raw())?;
-    validate_handle_info(&info, expected, &fs_name)?;
+    let fs_name = volume_fs_name(handle.raw()).map_err(DeleteError::Refused)?;
+    validate_handle_info(&info, expected, &fs_name).map_err(DeleteError::Refused)?;
 
     if let Err(code) = set_delete_disposition(handle.raw()) {
         let close = handle.close();
@@ -382,15 +520,15 @@ fn remove_file_by_handle(path: &Path, expected: FileId) -> Result<(), String> {
                 windows_error(close_code)
             ));
         }
-        return Err(message);
+        return Err(DeleteError::failed(message));
     }
 
     match handle.close() {
         Ok(()) => Ok(()),
-        Err(code) => Err(format!(
+        Err(code) => Err(DeleteError::unknown(format!(
             "削除指示は成功しましたが、ハンドルの解放に失敗しました。ファイルの状態を確認できません: {}",
             windows_error(code)
-        )),
+        ))),
     }
 }
 
@@ -502,12 +640,11 @@ fn remove_link_by_handle(
     path: &Path,
     expected: FileId,
     recorded_kind: NodeKind,
-) -> Result<(), String> {
+) -> Result<(), DeleteError> {
     if !expected.is_known() {
-        return Err(
-            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました"
-                .into(),
-        );
+        return Err(DeleteError::refused(
+            "走査時にファイル識別情報を取得できなかったため (ネットワークファイルシステム上を含む)、削除を中止しました",
+        ));
     }
 
     let fs_path = deletable_path(path);
@@ -524,19 +661,19 @@ fn remove_link_by_handle(
         )
     };
     if raw == INVALID_HANDLE_VALUE || raw.is_null() {
-        return Err(format!(
+        return Err(DeleteError::refused(format!(
             "リンクの削除用ハンドルを取得できないため、削除を中止しました: {}",
             windows_error(last_error())
-        ));
+        )));
     }
     let mut handle = DeleteHandle::new(raw);
 
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.raw(), &mut info) } == 0 {
-        return Err(format!(
+        return Err(DeleteError::refused(format!(
             "リンクのファイル情報を取得できないため、削除を中止しました: {}",
             windows_error(last_error())
-        ));
+        )));
     }
 
     let mut tag: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
@@ -549,14 +686,15 @@ fn remove_link_by_handle(
         )
     };
     if ok == 0 {
-        return Err(format!(
+        return Err(DeleteError::refused(format!(
             "リンクの再解析情報を取得できないため、削除を中止しました: {}",
             windows_error(last_error())
-        ));
+        )));
     }
 
-    let fs_name = volume_fs_name(handle.raw())?;
-    validate_link_handle_info(&info, &tag, expected, &fs_name, recorded_kind)?;
+    let fs_name = volume_fs_name(handle.raw()).map_err(DeleteError::Refused)?;
+    validate_link_handle_info(&info, &tag, expected, &fs_name, recorded_kind)
+        .map_err(DeleteError::Refused)?;
 
     if let Err(code) = set_delete_disposition(handle.raw()) {
         let close = handle.close();
@@ -567,39 +705,39 @@ fn remove_link_by_handle(
                 windows_error(close_code)
             ));
         }
-        return Err(message);
+        return Err(DeleteError::failed(message));
     }
 
     match handle.close() {
         Ok(()) => Ok(()),
-        Err(code) => Err(format!(
+        Err(code) => Err(DeleteError::unknown(format!(
             "リンクの削除指示は成功しましたが、ハンドルの解放に失敗しました。リンクの状態を確認できません: {}",
             windows_error(code)
-        )),
+        ))),
     }
 }
 
 /// リンク / ジャンクション / 特殊ファイル自体を削除する。再帰はしない。
 #[cfg(windows)]
-fn remove_link_or_leaf(path: &Path, md: &fs::Metadata) -> Result<(), String> {
+fn remove_link_or_leaf(path: &Path, md: &fs::Metadata) -> Result<(), DeleteError> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     if md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
-        fs::remove_dir(path).map_err(|e| format!("削除に失敗: {e}"))
+        remove_empty_dir(path)
     } else {
-        fs::remove_file(path).map_err(|e| format!("削除に失敗: {e}"))
+        fs::remove_file(path).map_err(map_remove_file_error)
     }
 }
 
 #[cfg(not(windows))]
-fn remove_link_or_leaf(path: &Path, md: &fs::Metadata) -> Result<(), String> {
+fn remove_link_or_leaf(path: &Path, md: &fs::Metadata) -> Result<(), DeleteError> {
     // リンクは symlink_metadata 上で is_dir() が false になるため、
     // ここで true になるのは実体のディレクトリ (別FSなどで中身を
     // 走査していない項目) だけ。再帰せず空のときだけ削除する。
     if md.file_type().is_dir() {
-        fs::remove_dir(path).map_err(|e| format!("削除に失敗: {e}"))
+        remove_empty_dir(path)
     } else {
-        fs::remove_file(path).map_err(|e| format!("削除に失敗: {e}"))
+        fs::remove_file(path).map_err(map_remove_file_error)
     }
 }
 
@@ -621,40 +759,102 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let (id, link_like) = id_of(&file);
 
-        remove_target(&file, NodeKind::File, id, link_like).unwrap();
+        remove_target(&file, NodeKind::File, id, link_like, false).unwrap();
         assert!(!file.exists());
     }
 
     #[test]
-    fn removes_directory_recursively() {
-        let dir = tempfile::tempdir().unwrap();
-        let victim = dir.path().join("victim");
-        fs::create_dir_all(victim.join("nested")).unwrap();
-        fs::write(victim.join("nested").join("a.bin"), b"x").unwrap();
-        let (id, link_like) = id_of(&victim);
-
-        remove_target(&victim, NodeKind::Dir, id, link_like).unwrap();
-        assert!(!victim.exists());
-    }
-
-    #[test]
-    fn directory_delete_removes_files_added_after_scan() {
-        // ディレクトリ自身の ID だけを検証し、中身は削除実行時点の状態を消す。
+    fn removes_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         fs::create_dir_all(&victim).unwrap();
         let (id, link_like) = id_of(&victim);
-        fs::write(victim.join("added-after-scan.txt"), b"x").unwrap();
 
-        remove_target(&victim, NodeKind::Dir, id, link_like).unwrap();
+        remove_target(&victim, NodeKind::Dir, id, link_like, false).unwrap();
         assert!(!victim.exists());
+    }
+
+    #[test]
+    fn refuses_non_empty_directory_without_deleting_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(victim.join("nested")).unwrap();
+        let child = victim.join("nested").join("a.bin");
+        fs::write(&child, b"x").unwrap();
+        let (id, link_like) = id_of(&victim);
+
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like, false).unwrap_err();
+        assert!(matches!(err, DeleteError::Refused(_)), "{err:?}");
+        assert!(err.contains("空ではない"), "{err}");
+        assert!(victim.exists());
+        assert!(child.exists());
+    }
+
+    #[test]
+    fn refuses_directory_with_file_added_after_scan() {
+        // 走査後に追加されたファイルがあっても、再帰削除はしない。
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let (id, link_like) = id_of(&victim);
+        let added = victim.join("added-after-scan.txt");
+        fs::write(&added, b"x").unwrap();
+
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like, false).unwrap_err();
+        assert!(matches!(err, DeleteError::Refused(_)), "{err:?}");
+        assert!(victim.exists());
+        assert!(added.exists());
+    }
+
+    #[test]
+    fn refuses_directory_with_hidden_child_not_in_tree() {
+        // 走査ツリーに出ていない隠し項目も、rmdir が拒否する。
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let (id, link_like) = id_of(&victim);
+        let hidden = victim.join(".hidden");
+        fs::write(&hidden, b"x").unwrap();
+
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like, false).unwrap_err();
+        assert!(matches!(err, DeleteError::Refused(_)), "{err:?}");
+        assert!(victim.exists());
+        assert!(hidden.exists());
+    }
+
+    #[test]
+    fn refuses_through_link_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("victim.txt");
+        fs::write(&file, b"x").unwrap();
+        let (id, link_like) = id_of(&file);
+
+        let err = remove_target(&file, NodeKind::File, id, link_like, true).unwrap_err();
+        assert!(matches!(err, DeleteError::Refused(_)), "{err:?}");
+        assert!(err.contains("リンク経由"), "{err}");
+        assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_protected_system_path() {
+        let path = Path::new("/usr");
+        let Ok(md) = fs::symlink_metadata(path) else {
+            return;
+        };
+        let id = platform::file_id(&md, path, false).expect("ID を取得できる");
+
+        let err = check_target(path, NodeKind::Dir, id, false, false).unwrap_err();
+        assert!(matches!(err, DeleteError::Refused(_)), "{err:?}");
+        assert!(err.contains("保護対象"), "{err}");
     }
 
     #[test]
     fn missing_target_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.txt");
-        let err = remove_target(&missing, NodeKind::File, FileId::UNKNOWN, false).unwrap_err();
+        let err =
+            remove_target(&missing, NodeKind::File, FileId::UNKNOWN, false, false).unwrap_err();
         assert!(err.contains("存在しません"), "{err}");
     }
 
@@ -666,7 +866,7 @@ mod tests {
         fs::write(victim.join("nested").join("a.bin"), b"x").unwrap();
         let (id, link_like) = id_of(&victim);
 
-        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
         assert!(err.contains("フォルダ"), "{err}");
         assert!(victim.exists());
     }
@@ -684,7 +884,7 @@ mod tests {
         symlink(&target, &link).unwrap();
         let (id, link_like) = id_of(&link);
 
-        remove_target(&link, NodeKind::Other, id, link_like).unwrap();
+        remove_target(&link, NodeKind::Other, id, link_like, false).unwrap();
 
         assert!(!link.exists());
         assert!(target.exists());
@@ -698,7 +898,7 @@ mod tests {
         fs::write(&victim, b"x").unwrap();
         let (id, link_like) = id_of(&victim);
 
-        let err = remove_target(&victim, NodeKind::Dir, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like, false).unwrap_err();
         assert!(err.contains("フォルダではなく"), "{err}");
         assert!(victim.exists());
     }
@@ -715,7 +915,7 @@ mod tests {
         symlink(&target, &link).unwrap();
         let (id, link_like) = id_of(&link);
 
-        remove_target(&link, NodeKind::File, id, link_like).unwrap();
+        remove_target(&link, NodeKind::File, id, link_like, false).unwrap();
 
         assert!(!link.exists());
         assert!(target.exists());
@@ -732,8 +932,8 @@ mod tests {
         fs::write(victim.join("a.bin"), b"x").unwrap();
         let (id, link_like) = id_of(&victim);
 
-        let err = remove_target(&victim, NodeKind::Blocked, id, link_like).unwrap_err();
-        assert!(!err.is_empty(), "{err}");
+        let err = remove_target(&victim, NodeKind::Blocked, id, link_like, false).unwrap_err();
+        assert!(!err.message().is_empty(), "{err}");
         assert!(victim.exists());
     }
 
@@ -749,7 +949,7 @@ mod tests {
         fs::remove_file(&victim).unwrap();
         fs::rename(&replacement, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
         assert_eq!(fs::read(&victim).unwrap(), b"new");
     }
@@ -761,7 +961,7 @@ mod tests {
         fs::write(&victim, b"old").unwrap();
         let (id, link_like) = id_of(&victim);
         // 確認ダイアログを開く時点の事前チェック。
-        check_target(&victim, NodeKind::File, id, link_like).unwrap();
+        check_target(&victim, NodeKind::File, id, link_like, false).unwrap();
 
         let replacement = dir.path().join("replacement.txt");
         fs::write(&replacement, b"new").unwrap();
@@ -769,7 +969,7 @@ mod tests {
         fs::rename(&replacement, &victim).unwrap();
 
         // 実際の削除時点では別ファイルになっている。
-        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
         assert_eq!(fs::read(&victim).unwrap(), b"new");
     }
@@ -789,7 +989,7 @@ mod tests {
         fs::remove_file(&victim).unwrap();
         symlink(&target, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
         assert!(
             err.contains("リンクに変わっています") || err.contains("置き換わっています"),
             "{err}"
@@ -819,7 +1019,7 @@ mod tests {
         fs::remove_file(&victim).unwrap();
         fs::rename(&replacement, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::Other, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::Other, id, link_like, false).unwrap_err();
         assert!(
             err.contains("リンクではなくなっています") || err.contains("置き換わっています"),
             "{err}"
@@ -837,7 +1037,7 @@ mod tests {
         fs::remove_file(&victim).unwrap();
         fs::create_dir(&victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
         assert!(
             err.contains("フォルダに変わっています") || err.contains("置き換わっています"),
             "{err}"
@@ -858,7 +1058,7 @@ mod tests {
         fs::remove_dir(&victim).unwrap();
         fs::rename(&replacement, &victim).unwrap();
 
-        let err = remove_target(&victim, NodeKind::Dir, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::Dir, id, link_like, false).unwrap_err();
         assert!(err.contains("置き換わっています"), "{err}");
         assert!(victim.join("keep.txt").exists());
     }
@@ -869,7 +1069,8 @@ mod tests {
         let victim = dir.path().join("victim.txt");
         fs::write(&victim, b"x").unwrap();
 
-        let err = remove_target(&victim, NodeKind::File, FileId::UNKNOWN, false).unwrap_err();
+        let err =
+            remove_target(&victim, NodeKind::File, FileId::UNKNOWN, false, false).unwrap_err();
         assert!(err.contains("走査時"), "{err}");
         assert!(victim.exists());
     }
@@ -886,7 +1087,7 @@ mod tests {
         #[cfg(windows)]
         {
             // Phase 2-B: Windows のハンドルベース削除はハードリンクを拒否する。
-            let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+            let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
             assert!(err.contains("ハードリンク"), "{err}");
             assert!(victim.exists());
             assert_eq!(fs::read(&victim).unwrap(), b"x");
@@ -894,7 +1095,7 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            remove_target(&victim, NodeKind::File, id, link_like).unwrap();
+            remove_target(&victim, NodeKind::File, id, link_like, false).unwrap();
             assert!(!victim.exists());
             assert_eq!(fs::read(&twin).unwrap(), b"x");
         }
@@ -915,7 +1116,7 @@ mod tests {
         fs::remove_file(&victim).unwrap();
         symlink_file(&target, &victim).expect("置き換え用のファイルシンボリックリンクを作成できる");
 
-        let err = remove_target(&victim, NodeKind::File, id, link_like).unwrap_err();
+        let err = remove_target(&victim, NodeKind::File, id, link_like, false).unwrap_err();
         assert!(
             err.contains("リンクに変わっています") || err.contains("置き換わっています"),
             "{err}"
@@ -944,7 +1145,7 @@ mod tests {
         assert!(status.success(), "ジャンクションを作成できません");
         let (id, link_like) = id_of(&link);
 
-        remove_target(&link, NodeKind::Other, id, link_like).unwrap();
+        remove_target(&link, NodeKind::Other, id, link_like, false).unwrap();
         assert!(fs::symlink_metadata(&link).is_err());
         assert!(target.join("keep.txt").exists());
     }
@@ -1153,7 +1354,7 @@ mod tests {
             fs::write(&file, b"x").unwrap();
             let (id, link_like) = id_of(&file);
 
-            remove_target(&file, NodeKind::File, id, link_like).unwrap();
+            remove_target(&file, NodeKind::File, id, link_like, false).unwrap();
             assert!(!file.exists());
         }
 
@@ -1168,7 +1369,7 @@ mod tests {
             permissions.set_readonly(true);
             fs::set_permissions(&file, permissions).unwrap();
 
-            let err = remove_target(&file, NodeKind::File, id, link_like).unwrap_err();
+            let err = remove_target(&file, NodeKind::File, id, link_like, false).unwrap_err();
             assert!(err.contains("読み取り専用"), "{err}");
             assert!(file.exists());
             assert_eq!(fs::read(&file).unwrap(), b"x");
@@ -1235,7 +1436,7 @@ mod tests {
             };
             assert!(lock != INVALID_HANDLE_VALUE && !lock.is_null());
 
-            let err = remove_target(&file, NodeKind::File, id, link_like).unwrap_err();
+            let err = remove_target(&file, NodeKind::File, id, link_like, false).unwrap_err();
             assert!(
                 err.contains("ハンドル") || err.contains("共有") || err.contains("sharing"),
                 "{err}"
@@ -1401,7 +1602,7 @@ mod tests {
             create_file_symlink(&target, &link);
             let (id, link_like) = id_of(&link);
 
-            remove_target(&link, NodeKind::Other, id, link_like).unwrap();
+            remove_target(&link, NodeKind::Other, id, link_like, false).unwrap();
 
             assert!(fs::symlink_metadata(&link).is_err());
             assert_eq!(fs::read(&target).unwrap(), b"keep");
@@ -1416,7 +1617,7 @@ mod tests {
             create_file_symlink(&target, &link);
             let (id, link_like) = id_of(&link);
 
-            remove_target(&link, NodeKind::File, id, link_like).unwrap();
+            remove_target(&link, NodeKind::File, id, link_like, false).unwrap();
 
             assert!(fs::symlink_metadata(&link).is_err());
             assert_eq!(fs::read(&target).unwrap(), b"keep");
@@ -1432,7 +1633,7 @@ mod tests {
             create_dir_symlink(&target, &link);
             let (id, link_like) = id_of(&link);
 
-            remove_target(&link, NodeKind::Dir, id, link_like).unwrap();
+            remove_target(&link, NodeKind::Dir, id, link_like, false).unwrap();
 
             assert!(fs::symlink_metadata(&link).is_err());
             assert!(target.is_dir());
@@ -1449,7 +1650,7 @@ mod tests {
             create_junction(&target, &link);
             let (id, link_like) = id_of(&link);
 
-            remove_target(&link, NodeKind::Dir, id, link_like).unwrap();
+            remove_target(&link, NodeKind::Dir, id, link_like, false).unwrap();
 
             assert!(fs::symlink_metadata(&link).is_err());
             assert!(target.is_dir());
@@ -1466,7 +1667,7 @@ mod tests {
             set_link_readonly(&link, true).unwrap();
             let (id, link_like) = id_of(&link);
 
-            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            let err = remove_target(&link, NodeKind::Other, id, link_like, false).unwrap_err();
             assert!(err.contains("読み取り専用"), "{err}");
             assert!(fs::symlink_metadata(&link).is_ok());
             assert_eq!(fs::read(&target).unwrap(), b"keep");
@@ -1496,7 +1697,7 @@ mod tests {
             );
             let (id, link_like) = id_of(&link);
 
-            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            let err = remove_target(&link, NodeKind::Other, id, link_like, false).unwrap_err();
             assert!(err.contains("ハードリンク"), "{err}");
             assert!(fs::symlink_metadata(&link).is_ok());
             assert!(fs::symlink_metadata(&hard).is_ok());
@@ -1527,7 +1728,7 @@ mod tests {
             };
             assert!(lock != INVALID_HANDLE_VALUE && !lock.is_null());
 
-            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            let err = remove_target(&link, NodeKind::Other, id, link_like, false).unwrap_err();
             assert!(
                 err.contains("ハンドル") || err.contains("共有") || err.contains("sharing"),
                 "{err}"
@@ -1552,7 +1753,7 @@ mod tests {
             fs::remove_file(&link).unwrap();
             create_file_symlink(&target, &link);
 
-            let err = remove_target(&link, NodeKind::Other, id, link_like).unwrap_err();
+            let err = remove_target(&link, NodeKind::Other, id, link_like, false).unwrap_err();
             assert!(err.contains("置き換わっています"), "{err}");
             assert!(fs::symlink_metadata(&link).is_ok());
             assert_eq!(fs::read(&target).unwrap(), b"keep");
