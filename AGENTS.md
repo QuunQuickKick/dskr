@@ -98,6 +98,9 @@ aarch64 + x86_64 の universal2 tar.gz を作る。Xcode Command Line Tools と
   NTFS を同じハンドルで検証してから disposition を設定する。対応タグは
   `IO_REPARSE_TAG_SYMLINK` と `IO_REPARSE_TAG_MOUNT_POINT` (DIRECTORY あり)
   だけで、失敗時に path-based 削除へフォールバックしない。
+  disposition 成功後の `CloseHandle` だけで削除完了とせず、対象パスを
+  `symlink_metadata` で再確認する。`NotFound` のみ成功とし、pending delete・
+  置換・ID 取得失敗などは `Unknown` として扱う。
 
 ## 将来の再帰削除（0.6.0 以降）
 

@@ -282,6 +282,18 @@ Windows 11 のローカル NTFS 上の通常ファイルは、`CreateFileW` で�
 拒否し、path-based 削除へフォールバックしません。disposition 成功後の
 `CloseHandle` 失敗は、削除指示成功・ハンドル解放状態不明として区別します。
 
+`CloseHandle` 成功後も、対象パスを `symlink_metadata` で再確認します。
+`NotFound` のときだけ削除完了とし、次の場合は `Unknown` とします。
+
+- 同じ FileId が残っている (他のハンドルが開いている pending delete を含む)
+- 別の FileId に置き換わっている
+- FileId を取得できない
+- 対象の種類が変わっている
+- Access Denied / Sharing Violation など、状態を確定できない
+
+これは pending delete を成功として扱わないための best-effort 確認であり、
+TOCTOU を完全には排除しません。
+
 通常ファイル経路は、ハードリンク、読み取り専用、リンク / 再解析ポイント、
 ディレクトリ、NTFS 以外を対象外とします。Windows 10、ReFS、FAT / exFAT、
 UNC / ネットワーク FS は未検証です。Windows の通常ディレクトリ、および
@@ -326,6 +338,11 @@ READONLY のリンク、NTFS 以外のリンクは拒否します。OneDrive プ
 拒否し、`DeleteFileW` / `RemoveDirectoryW` などの path-based 削除へ
 フォールバックしません。disposition 成功後の `CloseHandle` 失敗は、
 削除指示成功・ハンドル解放状態不明として区別します。
+
+リンク / ジャンクションも、`CloseHandle` 成功後に対象のリンク自身のパスを
+再確認します。`NotFound` のときだけ削除完了とし、リンクが残る場合や状態を
+確定できない場合は `Unknown` とします。リンク先の実データは削除しません。
+この確認は best-effort であり、TOCTOU を完全には排除しません。
 
 `IO_REPARSE_TAG_MOUNT_POINT` は DIRECTORY 属性ありのジャンクションとして
 扱います。ボリューム マウント ポイントは個別に検証していません。削除するのは
@@ -380,7 +397,7 @@ API がありません。Windows のディレクトリ・リンクとして記�
 行います。
 
 0.5.x では再帰削除がないため、複数対象の一部削除は発生しません。状態不明は
-Windows の `CloseHandle` 失敗などで発生し得ます。
+Windows の `CloseHandle` 失敗や pending delete などで発生し得ます。
 
 また、OS が削除直後に同じ inode / file index を再利用した場合、ID の比較だけでは
 新しいファイルと元のファイルを区別できません。リンク種別やファイル種別が変わった
@@ -453,10 +470,21 @@ JSON / CSV は再帰ではなく明示的なスタックで preorder 出力し�
 - OS のルート、システムディレクトリ、ホームディレクトリ本体などの保護パスを
   追加しました。ホーム配下の通常ファイルやプロジェクトは削除できます。
 - 削除結果を「拒否」「失敗」「一部削除」「状態不明」に区別するようにしました。
+- Windows のハンドルベース削除で、`CloseHandle` 後に pending delete を
+  best-effort で検出し、削除完了を確認できない場合は `Unknown` として扱う
+  ようにしました。`Unknown` ではツリーを detach せず、自動再試行しません。
 - UNC / ネットワーク / Unknown の削除拒否を維持しています。
 - 走査ルートがシンボリックリンク / ジャンクションの場合は `--allow-delete` を
   無効化します。
 - バージョン番号は変更していません。
 - 検証: ローカルの fmt / clippy / test / MSRV 1.85。Linux の tmpfs / bind mount
-  を用意したテストで、マウント境界を越えないことを確認。CI と Windows / macOS
-  の実機検証は未実施です。
+  を用意したテストで、マウント境界を越えないことを確認。
+- Windows 11 Home 25H2 (10.0.26200) / NTFS で、非管理者・管理者の両方で
+  25 PASS、0 FAIL、4 SKIP。pending delete（通常ファイル、file symlink、
+  directory symlink、junction）を `Unknown` として扱い、ツリーを detach
+  しないことを確認しました。
+- 修正前の管理者環境では 21 PASS / 1 FAIL / 4 SKIP で pending delete を
+  確認していました。
+- macOS 実機検証は未実施です。
+- CI は修正前の `e9b11b5` で Run `46099882311` に成功。修正後の CI は push
+  禁止のため未実行です。

@@ -16,6 +16,9 @@
   削除対象から除外しました。
 - 削除結果を「拒否」「失敗」「一部削除」「状態不明」に区別して表示するように
   しました。
+- Windows のハンドルベース削除で、`CloseHandle` 後の pending delete を
+  best-effort で検出し、削除完了を確認できない場合は `Unknown` として扱う
+  ようにしました。`Unknown` ではツリーを detach せず、自動再試行しません。
 
 ### 安全性・対応範囲
 
@@ -35,7 +38,15 @@
 - ローカルで `cargo fmt` / `cargo clippy` / `cargo test` / MSRV 1.85 を確認。
 - Linux の tmpfs / bind mount を用意したテストで、マウント境界を越えないことを
   確認。
-- CI と Windows / macOS の実機検証は未実施です (push 後に確認)。
+- Windows 11 Home 25H2 (10.0.26200) / NTFS で、非管理者・管理者の両方で
+  25 PASS、0 FAIL、4 SKIP。pending delete（通常ファイル、file symlink、
+  directory symlink、junction）を `Unknown` として扱い、ツリーを detach
+  しないことを確認しました。
+- 修正前の管理者環境では 21 PASS / 1 FAIL / 4 SKIP で pending delete を
+  確認していました。
+- macOS 実機検証は未実施です。
+- CI は修正前の `e9b11b5` で Run `46099882311` に成功。修正後の CI は push
+  禁止のため未実行です。
 
 ## [v0.5.1](https://github.com/QuunQuickKick/dskr/releases/tag/v0.5.1) (2026-11-28)
 
