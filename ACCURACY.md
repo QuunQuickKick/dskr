@@ -486,5 +486,5 @@ JSON / CSV は再帰ではなく明示的なスタックで preorder 出力し�
 - 修正前の管理者環境では 21 PASS / 1 FAIL / 4 SKIP で pending delete を
   確認していました。
 - macOS 実機検証は未実施です。
-- CI は修正前の `e9b11b5` で Run `46099882311` に成功。修正後の CI は push
-  禁止のため未実行です。
+- CI: Run `46108609825` 成功 (Linux / macOS / Windows、MSRV、パッケージ、
+  Linux マウントテスト)。Windows の pending delete テストも成功しました。
