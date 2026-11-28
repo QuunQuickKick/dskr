@@ -1,6 +1,6 @@
 [package]
 name = "dskr"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.85"
 description = "A fast file-size & disk-usage finder with a TUI (Windows/macOS/Linux)"

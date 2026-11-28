@@ -5,7 +5,7 @@
 ターミナルで確認できるツールです。Windows / macOS / Linux で動作する
 単一バイナリとして配布できます。
 
-> 詳細な使い方、OS ごとの対応表、トラブルシューティングは [USAGE.md](USAGE.md) を参照してください。サイズの数え方や `du` との違いは [ACCURACY.md](ACCURACY.md) にまとめています。`dskr --help` は実行する OS に合わせた内容を表示します。
+> 詳細な使い方、OS ごとの対応表、トラブルシューティングは [USAGE.md](USAGE.md) を参照してください。サイズの数え方や `du` との違いは [ACCURACY.md](ACCURACY.md) にまとめています。変更履歴は [CHANGELOG.md](CHANGELOG.md) にあります。`dskr --help` は実行する OS に合わせた内容を表示します。
 
 ```text
 dskr レポート
@@ -162,8 +162,8 @@ dskr-<version>-linux-x86_64/
 `/usr/share/doc/dskr/`、`/usr/share/licenses/dskr/` に配置します。
 
 ```sh
-sudo apt install ./dskr_0.5.0-1_amd64.deb
-sudo dnf install ./dskr-0.5.0-1.x86_64.rpm
+sudo apt install ./dskr_0.5.1-1_amd64.deb
+sudo dnf install ./dskr-0.5.1-1.x86_64.rpm
 ```
 
 静的 musl のため glibc のバージョンに依存しません。musl libc と Rust 標準
@@ -502,7 +502,7 @@ JSON (ツリー全体) と CSV (フラットな行) を出力します。
 ```json
 {
   "schema_version": 1,
-  "dskr_version": "0.5.0",
+  "dskr_version": "0.5.1",
   "generated_at": "2026-11-25T00:30:04.357Z",
   "root": "\\\\fileserver\\share",
   "root_kind": "unc",
